@@ -55,8 +55,9 @@ class PageData:
 
 
 class Logger:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, progress_callback=None) -> None:
         self.file = path.open("w", encoding="utf-8")
+        self.progress_callback = progress_callback
 
     def write(self, message: str = "") -> None:
         self.file.write(message + "\n")
@@ -65,6 +66,8 @@ class Logger:
             print(message)
         except UnicodeEncodeError:
             print(message.encode("ascii", errors="replace").decode("ascii"))
+        if self.progress_callback and hasattr(self.progress_callback, "on_log"):
+            self.progress_callback.on_log(message)
 
     def close(self) -> None:
         self.file.close()
@@ -645,7 +648,7 @@ def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str
     raise RuntimeError(f"translation batch {batch_index} failed")
 
 
-def translate_blocks(pages: list[PageData], api_key: str, logger: Logger) -> list[str]:
+def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None) -> list[str]:
     blocks = page_blocks(pages)
     texts = [block.text for _, block in blocks]
     results = texts[:]
@@ -658,11 +661,14 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger) -> lis
         f"  text blocks: {len(texts)}, translation units: {len(active)}, "
         f"covered blocks: {sum(len(unit.indexes) for unit in units)}, batches: {len(batches)}"
     )
+    if progress_callback and hasattr(progress_callback, "on_blocks_analyzed"):
+        progress_callback.on_blocks_analyzed(len(texts), len(active), len(batches))
 
     if not batches:
         return results
 
     workers = min(MAX_CONCURRENT_BATCHES, len(batches))
+    completed_batches = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
             executor.submit(translate_batch, batch_index, batch, api_key)
@@ -677,7 +683,10 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger) -> lis
                 for text_index, part in zip(unit.indexes, parts, strict=True):
                     results[text_index] = part
 
+            completed_batches += 1
             logger.write(f"  translated batch {batch_index}/{len(batches)}")
+            if progress_callback and hasattr(progress_callback, "on_batch_complete"):
+                progress_callback.on_batch_complete(completed_batches, len(batches))
 
     return results
 
@@ -855,21 +864,31 @@ def collect_pdfs(paths: list[Path]) -> list[Path]:
     return sorted(dict.fromkeys(path.resolve() for path in pdfs))
 
 
-def translate_pdf(pdf_path: Path, api_key: str, logger: Logger) -> Path:
+def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callback=None) -> Path:
     output_path = output_path_for(pdf_path)
     logger.write()
     logger.write(f"PDF: {pdf_path}")
     logger.write(f"OUT: {output_path}")
+    if progress_callback and hasattr(progress_callback, "on_start"):
+        progress_callback.on_start(pdf_path, output_path)
 
     doc = fitz.open(pdf_path)
     try:
         pages = extract_pages(doc)
         logger.write(f"  pages: {len(pages)}")
+        if progress_callback and hasattr(progress_callback, "on_pages_extracted"):
+            progress_callback.on_pages_extracted(len(pages))
 
-        translations = translate_blocks(pages, api_key, logger)
+        translations = translate_blocks(pages, api_key, logger, progress_callback)
         build_pdf(doc, pages, translations, output_path)
         logger.write(f"  saved: {output_path}")
+        if progress_callback and hasattr(progress_callback, "on_done"):
+            progress_callback.on_done(output_path)
         return output_path
+    except Exception as exc:
+        if progress_callback and hasattr(progress_callback, "on_failed"):
+            progress_callback.on_failed(str(exc))
+        raise exc
     finally:
         doc.close()
 

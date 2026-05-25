@@ -56,6 +56,37 @@ python rsc\translate_pdf.py original_PDF
 原文件名_zh-CN.pdf
 ```
 
+## 文献翻修工作台 (Web 浏览器界面)
+
+除了命令行界面，项目还提供了一个安静专业的 **双栏 PDF 实时对照翻译工作台**，支持文件拖拽上传、任务状态队列、实时批次进度展示、日志流推送，以及左右双栏原文与中文译文的页码和滚动同步对照阅读。
+
+### 运行启动方式
+
+1. **安装依赖**：
+   ```powershell
+   pip install -r requirements.txt
+   ```
+2. **启动后端服务**：
+   ```powershell
+   uvicorn rsc.web_app:app --host 127.0.0.1 --port 8000
+   ```
+3. **在浏览器中访问**：
+   打开 [http://127.0.0.1:8000/](http://127.0.0.1:8000/) 即可开始使用。
+
+### 本地前端开发
+
+如果您需要修改前端界面：
+1. **进入前端目录并安装依赖**：
+   ```powershell
+   cd my-react-app
+   npm install
+   ```
+2. **启动前端开发服务器**：
+   ```powershell
+   npm run dev
+   ```
+3. **在浏览器中访问** [http://localhost:5173/](http://localhost:5173/)，请求会自动被代理至后端的 `8000` 端口。
+
 ## 注意事项
 
 - `.env`、原始 PDF、翻译后 PDF、日志、调试脚本和 QA 截图默认不会提交。
