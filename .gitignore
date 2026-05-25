@@ -11,6 +11,7 @@ __pycache__/
 *.py[cod]
 /_qa_screenshots/
 /_qa_screenshots_luna/
+/_qa_screenshots_current/
 /_debug_api.py
 /_test_pdf_read.py
 /_debug_output.txt

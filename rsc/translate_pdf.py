@@ -41,6 +41,7 @@ class TextBlock:
     bold: bool
     italic: bool
     leading_bold: bool
+    align: str
 
 
 @dataclass(slots=True)
@@ -142,6 +143,42 @@ def split_caption_lines(lines: list[dict]) -> list[list[dict]]:
     return [lines]
 
 
+def split_wrapped_lines(page_width: float, lines: list[dict]) -> list[list[dict]]:
+    if len(lines) < 4:
+        return [lines]
+
+    rect = fitz.Rect(lines_bbox(lines))
+    if rect.width < page_width * 0.55:
+        return [lines]
+
+    narrow_x1 = rect.x1 - max(55, rect.width * 0.22)
+    groups = []
+    current = []
+    current_narrow = None
+
+    for line in lines:
+        if not line_text(line):
+            continue
+        is_narrow = line["bbox"][2] < narrow_x1
+        if current and is_narrow != current_narrow:
+            groups.append(current)
+            current = []
+        current.append(line)
+        current_narrow = is_narrow
+
+    if current:
+        groups.append(current)
+
+    if (
+        len(groups) > 1
+        and fitz.Rect(lines_bbox(groups[0])).width < rect.width - 55
+        and len(groups[0]) >= 3
+        and len(groups[1]) >= 2
+    ):
+        return [groups[0], [line for group in groups[1:] for line in group]]
+    return [lines]
+
+
 def trim_caption_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
     trimmed = []
     for block in blocks:
@@ -168,6 +205,7 @@ def trim_caption_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
                 bold=block.bold,
                 italic=block.italic,
                 leading_bold=block.leading_bold,
+                align=block.align,
             )
         )
     return trimmed
@@ -188,6 +226,13 @@ def first_font_size(lines: list[dict]) -> float:
             if size:
                 return float(size)
     return 8.0
+
+
+def block_align(page_width: float, lines: list[dict], font_size: float) -> str:
+    rect = fitz.Rect(lines_bbox(lines))
+    if font_size >= 11 and line_count(lines) <= 3 and abs(rect.x0 + rect.x1 - page_width) < 70:
+        return "center"
+    return "left"
 
 
 def span_is_bold(span: dict) -> bool:
@@ -251,27 +296,30 @@ def extract_pages(doc: fitz.Document) -> list[PageData]:
                 continue
 
             groups = split_caption_lines(raw.get("lines", []))
-            for group_index, lines in enumerate(groups):
-                text = block_text(lines)
-                if not text:
-                    continue
-                bold, italic, leading_bold = block_style(lines)
-                rect = lines_bbox(lines)
-                if group_index == 0 and len(groups) > 1 and is_caption(text):
-                    next_y = min(line["bbox"][1] for line in groups[1])
-                    rect = (rect[0], rect[1], rect[2], max(rect[1] + 6, min(rect[3], next_y - 1)))
+            for group_index, group in enumerate(groups):
+                for lines in split_wrapped_lines(page.rect.width, group):
+                    text = block_text(lines)
+                    if not text:
+                        continue
+                    bold, italic, leading_bold = block_style(lines)
+                    rect = lines_bbox(lines)
+                    if group_index == 0 and len(groups) > 1 and is_caption(text):
+                        next_y = min(line["bbox"][1] for line in groups[1])
+                        rect = (rect[0], rect[1], rect[2], max(rect[1] + 6, min(rect[3], next_y - 1)))
 
-                blocks.append(
-                    TextBlock(
-                        rect=rect,
-                        text=text,
-                        font_size=first_font_size(lines),
-                        line_count=line_count(lines),
-                        bold=bold,
-                        italic=italic,
-                        leading_bold=leading_bold,
+                    font_size = first_font_size(lines)
+                    blocks.append(
+                        TextBlock(
+                            rect=rect,
+                            text=text,
+                            font_size=font_size,
+                            line_count=line_count(lines),
+                            bold=bold,
+                            italic=italic,
+                            leading_bold=leading_bold,
+                            align=block_align(page.rect.width, lines, font_size),
+                        )
                     )
-                )
 
         blocks.sort(key=lambda block: reading_order_key(page.rect.width, block))
         blocks = trim_caption_blocks(blocks)
@@ -307,7 +355,11 @@ def find_references_range(pages: list[PageData]) -> tuple[int, float, int, float
         for block in page.blocks:
             if page.index == start_page and block.rect[1] <= start_y:
                 continue
-            if re.match(r"^(?:[A-Z]\s+)?Appendix\b|^NeurIPS Paper Checklist\b", block.text, re.IGNORECASE):
+            if re.match(
+                r"^(?:[A-Z]\s+)?(?:Append(?:ix|ices)|Technical Appendices|Supplementary Material)\b|^NeurIPS Paper Checklist\b",
+                block.text,
+                re.IGNORECASE,
+            ):
                 return start_page, start_y, page.index, block.rect[1]
 
     return start_page, start_y, len(pages), float("inf")
@@ -687,7 +739,7 @@ def clean_translation(text: str) -> str:
     return html.unescape(text)
 
 
-def textbox_css(font_size: float) -> str:
+def textbox_css(font_size: float, align: str) -> str:
     return f"""
 @font-face {{ font-family: SimSunLocal; src: url({SIMSUN_FONT}); }}
 @font-face {{ font-family: SimSunBoldLocal; src: url({SIMSUN_BOLD_FONT}); }}
@@ -695,7 +747,7 @@ def textbox_css(font_size: float) -> str:
 @font-face {{ font-family: TimesBoldLocal; src: url({TIMES_BOLD_FONT}); }}
 @font-face {{ font-family: TimesItalicLocal; src: url({TIMES_ITALIC_FONT}); }}
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({TIMES_BOLD_ITALIC_FONT}); }}
-body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; }}
+body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; text-align: {align}; }}
 .cjk {{ font-family: SimSunLocal; }}
 .latin {{ font-family: TimesLocal; }}
 .bold .cjk {{ font-family: SimSunBoldLocal; }}
@@ -707,8 +759,9 @@ body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; }}
 """
 
 
-def estimate_font_size(rect: fitz.Rect, text: str, original_size: float) -> float:
-    size = min(original_size, 10.0)
+def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock) -> float:
+    limit = 18.0 if (block.align == "center" or block.bold or block.line_count <= 2) else 10.0
+    size = min(block.font_size, limit)
     while size > MIN_FONT_SIZE:
         chars_per_line = max(1, int(rect.width / (size * 0.95)))
         line_count = (len(text) + chars_per_line - 1) // chars_per_line
@@ -723,13 +776,13 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str) -> Non
     cover = rect + (-0.8, -0.8, 0.8, 0.8)
     page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
 
-    font_size = estimate_font_size(rect, translated, block.font_size)
+    font_size = estimate_font_size(rect, translated, block)
     while font_size >= MIN_FONT_SIZE:
         page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
         spare_height, _ = page.insert_htmlbox(
             rect,
             styled_html(translated, block),
-            css=textbox_css(font_size),
+            css=textbox_css(font_size, block.align),
             scale_low=0.55,
             overlay=True,
         )
@@ -740,7 +793,7 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str) -> Non
     page.insert_htmlbox(
         rect,
         styled_html(translated, block),
-        css=textbox_css(MIN_FONT_SIZE),
+        css=textbox_css(MIN_FONT_SIZE, block.align),
         scale_low=0.4,
         overlay=True,
     )
