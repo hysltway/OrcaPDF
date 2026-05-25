@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,7 @@ TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
 TIMES_BOLD_ITALIC_FONT = "C:/Windows/Fonts/timesbi.ttf"
 MIN_FONT_SIZE = 4.5
+MAX_CONCURRENT_BATCHES = 8
 MAX_BATCH_ITEMS = 80
 MAX_BATCH_CHARS = 24000
 
@@ -613,6 +615,36 @@ def split_translation(text: str, blocks: list[TextBlock]) -> list[str]:
     return parts
 
 
+def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
+    data = [("target", TARGET_LANGUAGE), ("format", "text")]
+    data.extend(("q", text) for _, text in batch)
+
+    with requests.Session() as session:
+        for attempt in range(1, 4):
+            try:
+                response = session.post(
+                    TRANSLATE_URL,
+                    params={"key": api_key},
+                    data=data,
+                    timeout=60,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+                payload = response.json()
+                translations = payload["data"]["translations"]
+                return batch_index, [
+                    (unit_index, clean_translation(translated["translatedText"]))
+                    for (unit_index, _), translated in zip(batch, translations, strict=True)
+                ]
+            except Exception as exc:
+                if attempt == 3:
+                    raise RuntimeError(f"translation batch {batch_index} failed: {exc}") from exc
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(f"translation batch {batch_index} failed")
+
+
 def translate_blocks(pages: list[PageData], api_key: str, logger: Logger) -> list[str]:
     blocks = page_blocks(pages)
     texts = [block.text for _, block in blocks]
@@ -627,38 +659,25 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger) -> lis
         f"covered blocks: {sum(len(unit.indexes) for unit in units)}, batches: {len(batches)}"
     )
 
-    with requests.Session() as session:
-        for batch_index, batch in enumerate(batches, start=1):
-            data = [("target", TARGET_LANGUAGE), ("format", "text")]
-            data.extend(("q", text) for _, text in batch)
+    if not batches:
+        return results
 
-            for attempt in range(1, 4):
-                try:
-                    response = session.post(
-                        TRANSLATE_URL,
-                        params={"key": api_key},
-                        data=data,
-                        timeout=60,
-                    )
-                    if response.status_code >= 400:
-                        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+    workers = min(MAX_CONCURRENT_BATCHES, len(batches))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(translate_batch, batch_index, batch, api_key)
+            for batch_index, batch in enumerate(batches, start=1)
+        ]
+        for future in as_completed(futures):
+            batch_index, batch_results = future.result()
+            for unit_index, translated in batch_results:
+                unit = units[unit_index]
+                unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
+                parts = split_translation(translated, unit_blocks)
+                for text_index, part in zip(unit.indexes, parts, strict=True):
+                    results[text_index] = part
 
-                    payload = response.json()
-                    translations = payload["data"]["translations"]
-                    for (unit_index, _), translated in zip(batch, translations, strict=True):
-                        unit = units[unit_index]
-                        unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
-                        parts = split_translation(clean_translation(translated["translatedText"]), unit_blocks)
-                        for text_index, part in zip(unit.indexes, parts, strict=True):
-                            results[text_index] = part
-
-                    logger.write(f"  translated batch {batch_index}/{len(batches)}")
-                    break
-                except Exception as exc:
-                    if attempt == 3:
-                        raise RuntimeError(f"translation batch {batch_index} failed: {exc}") from exc
-                    logger.write(f"  retry batch {batch_index}/{len(batches)} after error: {exc}")
-                    time.sleep(2 * attempt)
+            logger.write(f"  translated batch {batch_index}/{len(batches)}")
 
     return results
 
