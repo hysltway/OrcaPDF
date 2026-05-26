@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -20,6 +21,7 @@ from rsc.translate_pdf import (
     OUTPUT_DIR,
     ROOT,
     SOURCE_DIR,
+    TARGET_LANGUAGE,
     translate_pdf,
 )
 
@@ -38,6 +40,7 @@ app.add_middleware(
 jobs = {}
 jobs_lock = threading.Lock()
 job_queue = queue.Queue()
+TRANSLATED_SUFFIX = f"_{TARGET_LANGUAGE}.pdf"
 
 
 def clean_upload_filename(filename: str | None) -> str:
@@ -64,6 +67,99 @@ def get_safe_filename(directory: Path, filename: str) -> str:
         if not (directory / new_filename).exists():
             return new_filename
         counter += 1
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_digest(file: UploadFile) -> str:
+    digest = hashlib.sha256()
+    file.file.seek(0)
+    for chunk in iter(lambda: file.file.read(1024 * 1024), b""):
+        digest.update(chunk)
+    file.file.seek(0)
+    return digest.hexdigest()
+
+
+def new_progress() -> dict:
+    return {
+        "pages": 0,
+        "blocks": 0,
+        "units": 0,
+        "batches_total": 0,
+        "batches_completed": 0
+    }
+
+
+def find_job_by_filename(filename: str) -> dict | None:
+    for job in jobs.values():
+        if job["filename"] == filename:
+            return job
+    return None
+
+
+def output_path_for_source_name(filename: str) -> Path:
+    return OUTPUT_DIR / f"{Path(filename).stem}_{TARGET_LANGUAGE}.pdf"
+
+
+def restore_processed_jobs():
+    SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with jobs_lock:
+        for translated_path in OUTPUT_DIR.glob(f"*{TRANSLATED_SUFFIX}"):
+            original_stem = translated_path.name[:-len(TRANSLATED_SUFFIX)]
+            original_name = f"{original_stem}.pdf"
+            original_path = SOURCE_DIR / original_name
+            if not original_path.is_file() or find_job_by_filename(original_name):
+                continue
+
+            progress = new_progress()
+            progress["batches_completed"] = 1
+            progress["batches_total"] = 1
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{original_name}:{translated_path.name}"))
+            jobs[job_id] = {
+                "id": job_id,
+                "filename": original_name,
+                "original_path": str(original_path),
+                "translated_path": str(translated_path),
+                "status": "done",
+                "progress": progress,
+                "logs": [f"Restored processed file: {translated_path.name}"],
+                "error": None,
+                "created_at": translated_path.stat().st_mtime
+            }
+
+
+def find_duplicate_source(digest: str) -> Path | None:
+    for pdf_path in SOURCE_DIR.glob("*.pdf"):
+        if file_digest(pdf_path) == digest:
+            return pdf_path
+    return None
+
+
+def create_job_data(source_path: Path, status: str = "queued", translated_path: Path | None = None) -> dict:
+    progress = new_progress()
+    if status == "done":
+        progress["batches_completed"] = 1
+        progress["batches_total"] = 1
+
+    return {
+        "id": str(uuid.uuid4()),
+        "filename": source_path.name,
+        "original_path": str(source_path),
+        "translated_path": str(translated_path) if translated_path else None,
+        "status": status,
+        "progress": progress,
+        "logs": [f"Job initialized. Original file saved as: {source_path.name}"],
+        "error": None,
+        "created_at": time.time()
+    }
 
 
 import urllib.parse
@@ -219,7 +315,8 @@ async def event_generator(job_id: str):
                         "progress": progress,
                         "logs": logs,
                         "error": job["error"],
-                        "filename": job["filename"]
+                        "filename": job["filename"],
+                        "translated_path": job["translated_path"]
                     })
 
                 should_break = current_status in ("done", "failed")
@@ -236,39 +333,45 @@ async def event_generator(job_id: str):
 async def create_jobs(files: List[UploadFile] = File(...)):
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    restore_processed_jobs()
 
     created_jobs = []
     for file in files:
         original_name = clean_upload_filename(file.filename)
+        digest = upload_digest(file)
+        duplicate_path = find_duplicate_source(digest)
+        if duplicate_path:
+            translated_path = output_path_for_source_name(duplicate_path.name)
+            with jobs_lock:
+                existing_job = find_job_by_filename(duplicate_path.name)
+                if existing_job:
+                    created_jobs.append(existing_job)
+                    continue
+
+                job_data = create_job_data(
+                    duplicate_path,
+                    "done" if translated_path.is_file() else "queued",
+                    translated_path if translated_path.is_file() else None
+                )
+                jobs[job_data["id"]] = job_data
+
+            if job_data["status"] == "queued":
+                job_queue.put(job_data["id"])
+            created_jobs.append(job_data)
+            continue
+
         safe_name = get_safe_filename(SOURCE_DIR, original_name)
         dest_path = SOURCE_DIR / safe_name
 
         with open(dest_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        job_id = str(uuid.uuid4())
-        job_data = {
-            "id": job_id,
-            "filename": safe_name,
-            "original_path": str(dest_path),
-            "translated_path": None,
-            "status": "queued",
-            "progress": {
-                "pages": 0,
-                "blocks": 0,
-                "units": 0,
-                "batches_total": 0,
-                "batches_completed": 0
-            },
-            "logs": [f"Job initialized. Original file saved as: {safe_name}"],
-            "error": None,
-            "created_at": time.time()
-        }
+        job_data = create_job_data(dest_path)
 
         with jobs_lock:
-            jobs[job_id] = job_data
+            jobs[job_data["id"]] = job_data
 
-        job_queue.put(job_id)
+        job_queue.put(job_data["id"])
         created_jobs.append(job_data)
 
     return created_jobs
@@ -276,6 +379,7 @@ async def create_jobs(files: List[UploadFile] = File(...)):
 
 @app.get("/api/jobs")
 async def get_jobs():
+    restore_processed_jobs()
     with jobs_lock:
         return sorted(jobs.values(), key=lambda j: j["created_at"], reverse=True)
 
