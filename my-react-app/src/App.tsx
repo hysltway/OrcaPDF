@@ -12,13 +12,14 @@ import {
   AlertCircle,
   BookOpen
 } from 'lucide-react';
-import * as pdfjsLib from 'pdfjs-dist';
+import { Document, Page, pdfjs } from 'react-pdf';
+import 'react-pdf/dist/Page/AnnotationLayer.css';
+import 'react-pdf/dist/Page/TextLayer.css';
 
-// Load local PDF worker using Vite url import to ensure offline compatibility
-// @ts-ignore
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url,
+).toString();
 
 interface JobProgress {
   pages: number;
@@ -50,14 +51,9 @@ function App() {
   const [pageNumber, setPageNumber] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   
-  const [originalPdfDoc, setOriginalPdfDoc] = useState<any | null>(null);
-  const [translatedPdfDoc, setTranslatedPdfDoc] = useState<any | null>(null);
-  
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
-  const canvasOriginalRef = useRef<HTMLCanvasElement>(null);
-  const canvasTranslatedRef = useRef<HTMLCanvasElement>(null);
   const leftViewportRef = useRef<HTMLDivElement>(null);
   const rightViewportRef = useRef<HTMLDivElement>(null);
   const logTerminalRef = useRef<HTMLDivElement>(null);
@@ -67,6 +63,12 @@ function App() {
   const isSyncingRight = useRef(false);
 
   const activeJob = jobs.find(j => j.id === activeJobId) || null;
+  const originalPdfUrl = activeJob
+    ? `/api/files/original/${encodeURIComponent(activeJob.filename)}`
+    : null;
+  const translatedPdfUrl = activeJob?.translated_path
+    ? `/api/files/translated/${encodeURIComponent(activeJob.translated_path.split(/[\\/]/).pop() || '')}`
+    : null;
 
   // Fetch initial job list
   const fetchJobs = useCallback(async () => {
@@ -77,6 +79,8 @@ function App() {
         setJobs(data);
         // If there is no active job selected yet, pick the first one
         if (data.length > 0 && !activeJobId) {
+          setPageNumber(1);
+          setTotalPages(1);
           setActiveJobId(data[0].id);
         }
       }
@@ -86,7 +90,7 @@ function App() {
   }, [activeJobId]);
 
   useEffect(() => {
-    fetchJobs();
+    queueMicrotask(fetchJobs);
     // Poll job list every 4 seconds to catch updates to background queues in other tabs
     const interval = setInterval(fetchJobs, 4000);
     return () => clearInterval(interval);
@@ -136,128 +140,6 @@ function App() {
       eventSource.close();
     };
   }, [activeJobId]);
-
-  // Load PDF documents using PDF.js when active job details change
-  useEffect(() => {
-    if (!activeJob) {
-      setOriginalPdfDoc(null);
-      setPageNumber(1);
-      setTotalPages(1);
-      return;
-    }
-
-    setPageNumber(1);
-    setOriginalPdfDoc(null);
-
-    const pdfUrl = `/api/files/original/${encodeURIComponent(activeJob.filename)}`;
-    const loadingTask = pdfjsLib.getDocument(pdfUrl);
-    loadingTask.promise.then((pdf: any) => {
-      setOriginalPdfDoc(pdf);
-      setTotalPages(pdf.numPages);
-    }).catch((err: any) => {
-      console.error("Error loading original PDF:", err);
-      setOriginalPdfDoc(null);
-    });
-  }, [activeJob?.filename]);
-
-  // Load translated PDF once completed
-  useEffect(() => {
-    if (!activeJob || activeJob.status !== 'done') {
-      setTranslatedPdfDoc(null);
-      return;
-    }
-
-    setTranslatedPdfDoc(null);
-
-    // Translate output file has suffix _zh-CN.pdf
-    const parts = activeJob.filename.split('.');
-    const ext = parts.pop();
-    const stem = parts.join('.');
-    const translatedName = `${stem}_zh-CN.${ext}`;
-
-    const pdfUrl = `/api/files/translated/${encodeURIComponent(translatedName)}`;
-    const loadingTask = pdfjsLib.getDocument(pdfUrl);
-    loadingTask.promise.then((pdf: any) => {
-      setTranslatedPdfDoc(pdf);
-    }).catch((err: any) => {
-      console.error("Error loading translated PDF:", err);
-      setTranslatedPdfDoc(null);
-    });
-  }, [activeJob?.filename, activeJob?.status]);
-
-  // Render original PDF page to canvas
-  useEffect(() => {
-    if (!originalPdfDoc || !canvasOriginalRef.current) return;
-
-    let isCurrent = true;
-    let renderTask: any = null;
-    
-    originalPdfDoc.getPage(pageNumber).then((page: any) => {
-      if (!isCurrent) return;
-      const viewport = page.getViewport({ scale });
-      const canvas = canvasOriginalRef.current!;
-      const context = canvas.getContext('2d');
-      if (!context) return;
-
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
-
-      const renderContext = {
-        canvasContext: context,
-        viewport: viewport,
-      };
-      renderTask = page.render(renderContext);
-      renderTask.promise.catch((err: any) => {
-        if (err?.name !== 'RenderingCancelledException') {
-          console.error("Failed to render original page:", err);
-        }
-      });
-    }).catch((err: any) => {
-      console.error("Failed to render original page:", err);
-    });
-
-    return () => {
-      isCurrent = false;
-      renderTask?.cancel();
-    };
-  }, [originalPdfDoc, pageNumber, scale]);
-
-  // Render translated PDF page to canvas
-  useEffect(() => {
-    if (!translatedPdfDoc || !canvasTranslatedRef.current) return;
-
-    let isCurrent = true;
-    let renderTask: any = null;
-
-    translatedPdfDoc.getPage(pageNumber).then((page: any) => {
-      if (!isCurrent) return;
-      const viewport = page.getViewport({ scale });
-      const canvas = canvasTranslatedRef.current!;
-      const context = canvas.getContext('2d');
-      if (!context) return;
-
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
-
-      const renderContext = {
-        canvasContext: context,
-        viewport: viewport,
-      };
-      renderTask = page.render(renderContext);
-      renderTask.promise.catch((err: any) => {
-        if (err?.name !== 'RenderingCancelledException') {
-          console.error("Failed to render translated page:", err);
-        }
-      });
-    }).catch((err: any) => {
-      console.error("Failed to render translated page:", err);
-    });
-
-    return () => {
-      isCurrent = false;
-      renderTask?.cancel();
-    };
-  }, [translatedPdfDoc, pageNumber, scale]);
 
   // Autoscroll terminal when log line count increases
   useEffect(() => {
@@ -332,6 +214,8 @@ function App() {
         const data = await res.json();
         setJobs(prev => [...data, ...prev]);
         if (data.length > 0) {
+          setPageNumber(1);
+          setTotalPages(1);
           setActiveJobId(data[0].id);
         }
       }
@@ -398,7 +282,13 @@ function App() {
               <div
                 key={job.id}
                 className={`job-card ${activeJobId === job.id ? 'active' : ''}`}
-                onClick={() => setActiveJobId(job.id)}
+                onClick={() => {
+                  if (activeJobId !== job.id) {
+                    setPageNumber(1);
+                    setTotalPages(1);
+                  }
+                  setActiveJobId(job.id);
+                }}
               >
                 <div className="job-card-header">
                   <span className="job-name" title={job.filename}>{job.filename}</span>
@@ -499,13 +389,30 @@ function App() {
                   <span>PAGE {pageNumber}</span>
                 </div>
                 <div className="pdf-viewport" ref={leftViewportRef} onScroll={handleLeftScroll}>
-                  {originalPdfDoc ? (
-                    <canvas ref={canvasOriginalRef} className="pdf-canvas-shadow" />
-                  ) : (
-                    <div className="watermark-overlay">
-                      <RefreshCw size={32} className="upload-icon" />
-                      <p>正在读取原文 PDF 结构，请稍候...</p>
-                    </div>
+                  {originalPdfUrl && (
+                    <Document
+                      file={originalPdfUrl}
+                      className="pdf-document"
+                      loading={
+                        <div className="watermark-overlay">
+                          <RefreshCw size={32} className="upload-icon" />
+                          <p>正在读取原文 PDF 结构，请稍候...</p>
+                        </div>
+                      }
+                      error={
+                        <div className="watermark-overlay" style={{ color: 'var(--danger-color)' }}>
+                          <AlertCircle size={40} />
+                          <p>原文 PDF 加载失败，请查看浏览器控制台或后端日志。</p>
+                        </div>
+                      }
+                      onLoadSuccess={({ numPages }) => setTotalPages(numPages)}
+                    >
+                      <Page
+                        pageNumber={pageNumber}
+                        scale={scale}
+                        className="pdf-page-shadow"
+                      />
+                    </Document>
                   )}
                 </div>
               </div>
@@ -519,29 +426,52 @@ function App() {
                   <span>PAGE {pageNumber}</span>
                 </div>
                 <div className="pdf-viewport" ref={rightViewportRef} onScroll={handleRightScroll}>
-                  {activeJob.status === 'done' && translatedPdfDoc ? (
-                    <canvas ref={canvasTranslatedRef} className="pdf-canvas-shadow" />
-                  ) : activeJob.status === 'failed' ? (
-                    <div className="watermark-overlay" style={{ color: 'var(--danger-color)' }}>
-                      <AlertCircle size={40} />
-                      <h3>翻译失败</h3>
-                      <p>{activeJob.error || '运行过程中出现未知异常，请查看下方控制台日志。'}</p>
-                    </div>
-                  ) : (
-                    <div className="watermark-overlay">
-                      <BookOpen size={40} />
-                      <h3>译文生成中</h3>
-                      <p>
-                        {activeJob.status === 'running' 
-                          ? `正在向 Google Translate 提交翻译批次并排版，当前已处理 ${activeJob.progress.batches_completed}/${activeJob.progress.batches_total} 个文本组...`
-                          : '当前任务正在后端翻译队列中排队，请在下方实时查看系统进度日志。'}
-                      </p>
-                      {activeJob.status === 'running' && activeJob.progress.batches_total > 0 && (
-                        <div style={{ width: '220px', height: '6px', backgroundColor: 'var(--border-color)', borderRadius: '99px', overflow: 'hidden' }}>
-                          <div style={{ height: '100%', backgroundColor: 'var(--accent-color)', width: `${(activeJob.progress.batches_completed / activeJob.progress.batches_total) * 100}%`, transition: 'width 0.3s' }} />
+                  {activeJob.status === 'done' && translatedPdfUrl ? (
+                    <Document
+                      file={translatedPdfUrl}
+                      className="pdf-document"
+                      loading={
+                        <div className="watermark-overlay">
+                          <RefreshCw size={32} className="upload-icon" />
+                          <p>正在读取译文 PDF 结构，请稍候...</p>
                         </div>
-                      )}
-                    </div>
+                      }
+                      error={
+                        <div className="watermark-overlay" style={{ color: 'var(--danger-color)' }}>
+                          <AlertCircle size={40} />
+                          <p>译文 PDF 加载失败，请查看浏览器控制台或后端日志。</p>
+                        </div>
+                      }
+                    >
+                      <Page
+                        pageNumber={pageNumber}
+                        scale={scale}
+                        className="pdf-page-shadow"
+                      />
+                    </Document>
+                  ) : (
+                    activeJob.status === 'failed' ? (
+                      <div className="watermark-overlay" style={{ color: 'var(--danger-color)' }}>
+                        <AlertCircle size={40} />
+                        <h3>翻译失败</h3>
+                        <p>{activeJob.error || '运行过程中出现未知异常，请查看下方控制台日志。'}</p>
+                      </div>
+                    ) : (
+                      <div className="watermark-overlay">
+                        <BookOpen size={40} />
+                        <h3>译文生成中</h3>
+                        <p>
+                          {activeJob.status === 'running' 
+                            ? `正在向 Google Translate 提交翻译批次并排版，当前已处理 ${activeJob.progress.batches_completed}/${activeJob.progress.batches_total} 个文本组...`
+                            : '当前任务正在后端翻译队列中排队，请在下方实时查看系统进度日志。'}
+                        </p>
+                        {activeJob.status === 'running' && activeJob.progress.batches_total > 0 && (
+                          <div style={{ width: '220px', height: '6px', backgroundColor: 'var(--border-color)', borderRadius: '99px', overflow: 'hidden' }}>
+                            <div style={{ height: '100%', backgroundColor: 'var(--accent-color)', width: `${(activeJob.progress.batches_completed / activeJob.progress.batches_total) * 100}%`, transition: 'width 0.3s' }} />
+                          </div>
+                        )}
+                      </div>
+                    )
                   )}
                 </div>
               </div>

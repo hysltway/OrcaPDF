@@ -66,14 +66,19 @@ def get_safe_filename(directory: Path, filename: str) -> str:
         counter += 1
 
 
+import urllib.parse
+
 def resolve_pdf_file(directory: Path, name: str) -> Path:
-    if not name or "/" in name or "\\" in name:
+    decoded_name = urllib.parse.unquote(name)
+    if not decoded_name or "/" in decoded_name or "\\" in decoded_name:
         raise HTTPException(status_code=404, detail="File not found")
 
     root = directory.resolve()
-    file_path = (directory / name).resolve()
-    if file_path.parent != root or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
+    file_path = (directory / decoded_name).resolve()
+    if not file_path.is_file() or file_path.parent != root:
+        file_path = (directory / name).resolve()
+        if not file_path.is_file() or file_path.parent != root:
+            raise HTTPException(status_code=404, detail="File not found")
     return file_path
 
 

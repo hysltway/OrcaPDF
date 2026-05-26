@@ -8,6 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import fitz
@@ -28,6 +29,15 @@ TIMES_FONT = "C:/Windows/Fonts/times.ttf"
 TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
 TIMES_BOLD_ITALIC_FONT = "C:/Windows/Fonts/timesbi.ttf"
+FONT_DIR = str(Path(SIMSUN_FONT).parent)
+FONT_FACE_CSS = f"""
+@font-face {{ font-family: SimSunLocal; src: url({Path(SIMSUN_FONT).name}); }}
+@font-face {{ font-family: SimSunBoldLocal; src: url({Path(SIMSUN_BOLD_FONT).name}); }}
+@font-face {{ font-family: TimesLocal; src: url({Path(TIMES_FONT).name}); }}
+@font-face {{ font-family: TimesBoldLocal; src: url({Path(TIMES_BOLD_FONT).name}); }}
+@font-face {{ font-family: TimesItalicLocal; src: url({Path(TIMES_ITALIC_FONT).name}); }}
+@font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
+"""
 MIN_FONT_SIZE = 4.5
 MAX_CONCURRENT_BATCHES = 8
 MAX_BATCH_ITEMS = 80
@@ -767,14 +777,10 @@ def clean_translation(text: str) -> str:
     return html.unescape(text)
 
 
+@cache
 def textbox_css(font_size: float, align: str) -> str:
     return f"""
-@font-face {{ font-family: SimSunLocal; src: url({SIMSUN_FONT}); }}
-@font-face {{ font-family: SimSunBoldLocal; src: url({SIMSUN_BOLD_FONT}); }}
-@font-face {{ font-family: TimesLocal; src: url({TIMES_FONT}); }}
-@font-face {{ font-family: TimesBoldLocal; src: url({TIMES_BOLD_FONT}); }}
-@font-face {{ font-family: TimesItalicLocal; src: url({TIMES_ITALIC_FONT}); }}
-@font-face {{ font-family: TimesBoldItalicLocal; src: url({TIMES_BOLD_ITALIC_FONT}); }}
+{FONT_FACE_CSS}
 body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; text-align: {align}; }}
 .cjk {{ font-family: SimSunLocal; }}
 .latin {{ font-family: TimesLocal; }}
@@ -799,38 +805,52 @@ def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock) -> float:
     return MIN_FONT_SIZE
 
 
-def write_translation(page: fitz.Page, block: TextBlock, translated: str) -> None:
+def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive) -> int:
     rect = fitz.Rect(block.rect)
     cover = rect + (-0.8, -0.8, 0.8, 0.8)
     page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
 
+    html_text = styled_html(translated, block)
     font_size = estimate_font_size(rect, translated, block)
+    layout_calls = 0
     while font_size >= MIN_FONT_SIZE:
-        page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+        layout_calls += 1
         spare_height, _ = page.insert_htmlbox(
             rect,
-            styled_html(translated, block),
+            html_text,
             css=textbox_css(font_size, block.align),
+            archive=archive,
             scale_low=0.55,
             overlay=True,
         )
         if spare_height >= 0:
-            return
+            return layout_calls
         font_size -= 0.5
 
+    layout_calls += 1
     page.insert_htmlbox(
         rect,
-        styled_html(translated, block),
+        html_text,
         css=textbox_css(MIN_FONT_SIZE, block.align),
+        archive=archive,
         scale_low=0.4,
         overlay=True,
     )
+    return layout_calls
 
 
-def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: list[str], output_path: Path) -> None:
+def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: list[str], output_path: Path, logger: Logger = None) -> None:
     output = fitz.open()
     output.insert_pdf(source_doc)
     translation_index = 0
+    total_blocks = sum(len(page_data.blocks) for page_data in pages)
+    processed_blocks = 0
+    layout_calls = 0
+    render_start = time.perf_counter()
+    archive = fitz.Archive(FONT_DIR)
+
+    if logger:
+        logger.write(f"  typesetting PDF: writing {total_blocks} translated blocks...")
 
     for page_data in pages:
         target_page = output[page_data.index]
@@ -839,15 +859,29 @@ def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: li
             translation_index += 1
             if translated == block.text:
                 continue
-            write_translation(target_page, block, translated)
+            layout_calls += write_translation(target_page, block, translated, archive)
+            processed_blocks += 1
+            if logger and processed_blocks % 10 == 0:
+                logger.write(f"    typesetting: rendered {processed_blocks}/{total_blocks} blocks...")
+
+    if logger:
+        render_seconds = time.perf_counter() - render_start
+        logger.write(
+            f"  typesetting: rendered {processed_blocks} changed blocks in "
+            f"{render_seconds:.1f}s ({layout_calls} html layout calls)"
+        )
+        logger.write("  typesetting: saving finalized PDF output...")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     if tmp_path.exists():
         tmp_path.unlink()
+    save_start = time.perf_counter()
     output.save(tmp_path, garbage=4, deflate=True)
     output.close()
     tmp_path.replace(output_path)
+    if logger:
+        logger.write(f"  typesetting: saved finalized PDF in {time.perf_counter() - save_start:.1f}s")
 
 
 def output_path_for(pdf_path: Path) -> Path:
@@ -872,7 +906,9 @@ def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callbac
     if progress_callback and hasattr(progress_callback, "on_start"):
         progress_callback.on_start(pdf_path, output_path)
 
-    doc = fitz.open(pdf_path)
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         pages = extract_pages(doc)
         logger.write(f"  pages: {len(pages)}")
@@ -880,7 +916,7 @@ def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callbac
             progress_callback.on_pages_extracted(len(pages))
 
         translations = translate_blocks(pages, api_key, logger, progress_callback)
-        build_pdf(doc, pages, translations, output_path)
+        build_pdf(doc, pages, translations, output_path, logger)
         logger.write(f"  saved: {output_path}")
         if progress_callback and hasattr(progress_callback, "on_done"):
             progress_callback.on_done(output_path)
