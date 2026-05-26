@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import mimetypes
 import os
 import queue
 import shutil
@@ -26,6 +27,7 @@ from rsc.translate_pdf import (
 )
 
 app = FastAPI(title="PDF Translation Workbench API")
+mimetypes.add_type("application/javascript", ".mjs")
 
 # Enable CORS for local development
 app.add_middleware(
