@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import cache
@@ -25,9 +26,10 @@ LOG_PATH = ROOT / "_translate_log.txt"
 SILICONFLOW_CHAT_URL = "https://api.siliconflow.cn/v1/chat/completions"
 SILICONFLOW_MODEL = "tencent/Hunyuan-MT-7B"
 TRANSLATE_API_KEY_ENV = "siliconflow_TRANSLATE_API_KEY"
+TYPESETTING_LINE_HEIGHT_ENV = "PDF_TRANSLATE_LINE_HEIGHT"
 TARGET_LANGUAGE = "zh-CN"
 CJK_REGULAR_FONT = "C:/Windows/Fonts/STSONG.TTF"
-CJK_BOLD_FONT = "C:/Windows/Fonts/msyhbd.ttc"
+CJK_BOLD_FONT = CJK_REGULAR_FONT
 TIMES_FONT = "C:/Windows/Fonts/times.ttf"
 TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
@@ -41,11 +43,19 @@ FONT_FACE_CSS = f"""
 @font-face {{ font-family: TimesItalicLocal; src: url({Path(TIMES_ITALIC_FONT).name}); }}
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
 """
-MIN_FONT_SIZE = 4.5
-TEXT_LINE_HEIGHT = 1.0
-MAX_CONCURRENT_BATCHES = 12
-MAX_BATCH_ITEMS = 6
-MAX_BATCH_CHARS = 4000
+MIN_FONT_SIZE = 4.5  # 翻译回写 PDF 时的最小字号限制（防止文字缩得过小无法阅读）
+DEFAULT_TEXT_LINE_HEIGHT = 1.0  # 排版时默认的文本行高
+MAX_CONCURRENT_BATCHES = 128  # 允许并发提交到大模型翻译的批次（Batch）上限
+MAX_BATCH_ITEMS = 1  # 每个翻译批次中包含的文本单元（Unit）数量最大值
+MAX_BATCH_CHARS = 12000  # 每个翻译批次所允许的最大字符长度限制
+MAX_UNIT_CHARS = 2500  # 单个合并文本单元（Unit）的最大字符长度上限
+MAX_CONCURRENT_PDFS = 4  # 允许同时并发处理的 PDF 文件任务上限
+TRANSLATION_ATTEMPTS = 3  # 单个翻译请求失败后的最大重试次数
+TRANSLATION_TIMEOUT = 60  # 单个翻译请求的超时时间（秒）
+RETRY_SLEEP_SECONDS = 0.5  # 翻译失败重试前的休眠等待时间（秒）
+
+_llm_request_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_BATCHES)
+_thread_state = threading.local()
 
 
 @dataclass(slots=True)
@@ -72,19 +82,22 @@ class Logger:
     def __init__(self, path: Path, progress_callback=None) -> None:
         self.file = path.open("w", encoding="utf-8")
         self.progress_callback = progress_callback
+        self.lock = threading.Lock()
 
     def write(self, message: str = "") -> None:
-        self.file.write(message + "\n")
-        self.file.flush()
-        try:
-            print(message)
-        except UnicodeEncodeError:
-            print(message.encode("ascii", errors="replace").decode("ascii"))
-        if self.progress_callback and hasattr(self.progress_callback, "on_log"):
-            self.progress_callback.on_log(message)
+        with self.lock:
+            self.file.write(message + "\n")
+            self.file.flush()
+            try:
+                print(message)
+            except UnicodeEncodeError:
+                print(message.encode("ascii", errors="replace").decode("ascii"))
+            if self.progress_callback and hasattr(self.progress_callback, "on_log"):
+                self.progress_callback.on_log(message)
 
     def close(self) -> None:
-        self.file.close()
+        with self.lock:
+            self.file.close()
 
 
 def clean_text(text: str) -> str:
@@ -394,7 +407,8 @@ def is_reference_block(page: PageData, block: TextBlock, reference_range: tuple[
     if page.index < start_page:
         return False
     if page.index == start_page and block.rect[1] < start_y - 4:
-        return False
+        rect = fitz.Rect(block.rect)
+        return start_y < 160 and rect.x0 > page.width / 2
     if page.index == end_page and block.rect[1] >= end_y - 4:
         return False
     return True
@@ -545,14 +559,18 @@ def body_font_size(pages: list[PageData], references_start: tuple[int, float, in
     return round(sizes[len(sizes) // 2] * 2) / 2
 
 
-def translation_batches(items: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+def translation_batches(
+    items: list[tuple[int, str]],
+    max_items: int = MAX_BATCH_ITEMS,
+    max_chars: int = MAX_BATCH_CHARS,
+) -> list[list[tuple[int, str]]]:
     batches = []
     batch = []
     char_count = 0
 
     for item in items:
         text_len = len(item[1])
-        if batch and (len(batch) >= MAX_BATCH_ITEMS or char_count + text_len > MAX_BATCH_CHARS):
+        if batch and (len(batch) >= max_items or char_count + text_len > max_chars):
             batches.append(batch)
             batch = []
             char_count = 0
@@ -624,7 +642,8 @@ def translation_units(blocks: list[tuple[PageData, TextBlock]], references_start
                 previous = None
             continue
 
-        if previous is None or not can_merge(previous[1], previous[2], page, block):
+        merged_text_len = sum(len(text) for text in current_texts) + len(block.text) + len(current_texts)
+        if previous is None or not can_merge(previous[1], previous[2], page, block) or merged_text_len > MAX_UNIT_CHARS:
             if current_indexes:
                 units.append(Unit(current_indexes, " ".join(current_texts)))
             current_indexes = [index]
@@ -639,7 +658,7 @@ def translation_units(blocks: list[tuple[PageData, TextBlock]], references_start
     return units
 
 
-def split_translation(text: str, blocks: list[TextBlock]) -> list[str]:
+def split_translation(text: str, blocks: list[TextBlock], line_height: float) -> list[str]:
     if len(blocks) == 1:
         return [text]
 
@@ -647,7 +666,7 @@ def split_translation(text: str, blocks: list[TextBlock]) -> list[str]:
     for block in blocks:
         rect = fitz.Rect(block.rect)
         chars_per_line = max(1, int(rect.width / (block.font_size * 0.95)))
-        lines = max(1, int(rect.height / (block.font_size * TEXT_LINE_HEIGHT)))
+        lines = max(1, int(rect.height / (block.font_size * line_height)))
         capacities.append(chars_per_line * lines)
     total = sum(capacities)
     parts = []
@@ -688,7 +707,19 @@ def parse_translation_response(text: str) -> dict[int, str]:
     }
 
 
+def thread_session() -> requests.Session:
+    session = getattr(_thread_state, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_state.session = session
+    return session
+
+
 def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
+    if len(batch) == 1:
+        unit_index, text = batch[0]
+        return batch_index, [(unit_index, translate_unit_text(unit_index, text, api_key))]
+
     total_chars = sum(len(text) for _, text in batch)
     payload = {
         "model": SILICONFLOW_MODEL,
@@ -720,90 +751,86 @@ def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str
         "Content-Type": "application/json",
     }
 
-    with requests.Session() as session:
-        for attempt in range(1, 4):
+    session = thread_session()
+    with _llm_request_semaphore:
+        for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
             try:
                 response = session.post(
                     SILICONFLOW_CHAT_URL,
                     headers=headers,
                     json=payload,
-                    timeout=45,
+                    timeout=TRANSLATION_TIMEOUT,
                 )
                 if response.status_code >= 400:
                     raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
 
                 message = response.json()["choices"][0]["message"]
                 by_id = parse_translation_response(message["content"])
-                missing = [(unit_index, text) for unit_index, text in batch if unit_index not in by_id]
-                if missing:
-                    for unit_index, translated in translate_plain_batch(missing, api_key):
-                        by_id[unit_index] = translated
-                return batch_index, [(unit_index, by_id[unit_index]) for unit_index, _ in batch]
+                batch_results = [
+                    (unit_index, by_id[unit_index])
+                    for unit_index, _ in batch
+                    if unit_index in by_id
+                ]
+                return batch_index, batch_results
             except Exception as exc:
-                if attempt == 3:
+                if attempt == TRANSLATION_ATTEMPTS:
                     raise RuntimeError(f"translation batch {batch_index} failed: {exc}") from exc
-                time.sleep(2 * attempt)
+                time.sleep(RETRY_SLEEP_SECONDS)
 
     raise RuntimeError(f"translation batch {batch_index} failed")
 
 
-def translate_single(unit_index: int, text: str, api_key: str) -> tuple[int, str]:
-    return translate_plain_batch([(unit_index, text)], api_key)[0]
-
-
-def translate_plain_batch(batch: list[tuple[int, str]], api_key: str) -> list[tuple[int, str]]:
-    results = []
+def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
+    payload = {
+        "model": SILICONFLOW_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are translating academic PDF text from English into Simplified Chinese. "
+                    "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
+                    "Preserve terminology, proper nouns, citations, numbers, units, formulas, and inline variables. "
+                    "Return only the translated Chinese text. Do not add explanations, notes, markdown, or quotes."
+                ),
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ],
+        "max_tokens": max(512, min(8192, len(text) * 2)),
+        "temperature": 0.1,
+        "top_p": 0.7,
+    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    with requests.Session() as session:
-        for unit_index, text in batch:
-            payload = {
-                "model": SILICONFLOW_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are translating academic PDF text from English into Simplified Chinese. "
-                            "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
-                            "Preserve terminology, proper nouns, citations, numbers, units, formulas, and inline variables. "
-                            "Return only the translated Chinese text. Do not add explanations, notes, markdown, or quotes."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": text,
-                    },
-                ],
-                "max_tokens": max(512, min(4096, len(text) * 2)),
-                "temperature": 0.1,
-                "top_p": 0.7,
-            }
+    session = thread_session()
+    with _llm_request_semaphore:
+        for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+            try:
+                response = session.post(
+                    SILICONFLOW_CHAT_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=TRANSLATION_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
 
-            for attempt in range(1, 4):
-                try:
-                    response = session.post(
-                        SILICONFLOW_CHAT_URL,
-                        headers=headers,
-                        json=payload,
-                        timeout=45,
-                    )
-                    if response.status_code >= 400:
-                        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+                message = response.json()["choices"][0]["message"]
+                return clean_translation(message["content"].strip())
+            except Exception as exc:
+                if attempt == TRANSLATION_ATTEMPTS:
+                    raise RuntimeError(f"translation unit {unit_index} failed: {exc}") from exc
+                time.sleep(RETRY_SLEEP_SECONDS)
 
-                    message = response.json()["choices"][0]["message"]
-                    results.append((unit_index, clean_translation(message["content"].strip())))
-                    break
-                except Exception as exc:
-                    if attempt == 3:
-                        raise RuntimeError(f"translation unit {unit_index} failed: {exc}") from exc
-                    time.sleep(2 * attempt)
-    return results
+    raise RuntimeError(f"translation unit {unit_index} failed")
 
 
-def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None) -> list[str]:
+def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None, line_height: float = DEFAULT_TEXT_LINE_HEIGHT) -> list[str]:
     blocks = page_blocks(pages)
     texts = [block.text for _, block in blocks]
     results = texts[:]
@@ -814,7 +841,7 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
 
     logger.write(
         f"  text blocks: {len(texts)}, translation units: {len(active)}, "
-        f"covered blocks: {sum(len(unit.indexes) for unit in units)}, batches: {len(batches)}"
+        f"blocks selected for translation: {sum(len(unit.indexes) for unit in units)}, batches: {len(batches)}"
     )
     if progress_callback and hasattr(progress_callback, "on_blocks_analyzed"):
         progress_callback.on_blocks_analyzed(len(texts), len(active), len(batches))
@@ -823,31 +850,53 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
         return results
 
     workers = min(MAX_CONCURRENT_BATCHES, len(batches))
+    total_batches = len(batches)
     completed_batches = 0
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(translate_batch, batch_index, batch, api_key): batch_index
-            for batch_index, batch in enumerate(batches, start=1)
-        }
-        for future in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=workers)
+    future_batches = {
+        executor.submit(translate_batch, batch_index, batch, api_key): batch
+        for batch_index, batch in enumerate(batches, start=1)
+    }
+    future_labels = {
+        future: batch_index
+        for batch_index, future in enumerate(future_batches, start=1)
+    }
+    try:
+        while future_batches:
+            future = next(as_completed(future_batches))
+            source_batch = future_batches.pop(future)
+            label = future_labels.pop(future)
             try:
                 batch_index, batch_results = future.result()
-            except Exception as exc:
-                batch_index = futures[future]
-                logger.write(f"  batch {batch_index}/{len(batches)} failed, retrying once: {exc}")
-                batch_results = [translate_single(unit_index, text, api_key) for unit_index, text in batches[batch_index - 1]]
+            except Exception:
+                for pending in future_batches:
+                    pending.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+            translated_ids = {unit_index for unit_index, _ in batch_results}
+            missing = [
+                (unit_index, text)
+                for unit_index, text in source_batch
+                if unit_index not in translated_ids
+            ]
+            if missing:
+                missing_ids = ", ".join(str(unit_index) for unit_index, _ in missing)
+                raise RuntimeError(f"translation batch {label} missing ids: {missing_ids}")
 
             for unit_index, translated in batch_results:
                 unit = units[unit_index]
                 unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
-                parts = split_translation(translated, unit_blocks)
+                parts = split_translation(translated, unit_blocks, line_height)
                 for text_index, part in zip(unit.indexes, parts, strict=True):
                     results[text_index] = part
 
             completed_batches += 1
-            logger.write(f"  translated batch {batch_index}/{len(batches)}")
+            logger.write(f"  translated batch {batch_index}/{total_batches}")
             if progress_callback and hasattr(progress_callback, "on_batch_complete"):
-                progress_callback.on_batch_complete(completed_batches, len(batches))
+                progress_callback.on_batch_complete(completed_batches, total_batches)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
     return results
 
@@ -958,10 +1007,10 @@ def clean_translation(text: str) -> str:
 
 
 @cache
-def textbox_css(font_size: float, align: str) -> str:
+def textbox_css(font_size: float, align: str, line_height: float) -> str:
     return f"""
 {FONT_FACE_CSS}
-body {{ margin: 0; font-size: {font_size}pt; line-height: {TEXT_LINE_HEIGHT}; text-align: {align}; }}
+body {{ margin: 0; font-size: {font_size}pt; line-height: {line_height}; text-align: {align}; }}
 .cjk {{ font-family: CjkRegularLocal; }}
 .latin {{ font-family: TimesLocal; }}
 .bold .cjk {{ font-family: CjkBoldLocal; }}
@@ -973,7 +1022,7 @@ body {{ margin: 0; font-size: {font_size}pt; line-height: {TEXT_LINE_HEIGHT}; te
 """
 
 
-def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_body_size: float | None) -> float:
+def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_body_size: float | None, line_height: float) -> float:
     limit = 18.0 if (block.align == "center" or block.bold or block.line_count <= 2) else 10.0
     source_size = (
         regular_body_size
@@ -990,53 +1039,35 @@ def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_bod
     size = min(source_size, limit)
     chars_per_line = max(1, int(rect.width / (size * 0.9)))
     line_count = (len(text) + chars_per_line - 1) // chars_per_line
-    if line_count * size * TEXT_LINE_HEIGHT > rect.height * 1.35:
+    if line_count * size * line_height > rect.height * 1.35:
         while size > MIN_FONT_SIZE:
             chars_per_line = max(1, int(rect.width / (size * 0.9)))
             line_count = (len(text) + chars_per_line - 1) // chars_per_line
-            if line_count * size * TEXT_LINE_HEIGHT <= rect.height * 1.2:
+            if line_count * size * line_height <= rect.height * 1.2:
                 return size
             size -= 0.5
     return size
 
 
-def redact_original_text(page: fitz.Page, blocks: list[TextBlock]) -> int:
-    count = 0
+def cover_original_text(page: fitz.Page, blocks: list[TextBlock]) -> int:
     for block in blocks:
         rect = fitz.Rect(block.rect) + (-0.8, -0.8, 0.8, 0.8)
-        page.add_redact_annot(rect, fill=(1, 1, 1), cross_out=False)
-        count += 1
-    if count:
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_NONE,
-            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            text=fitz.PDF_REDACT_TEXT_REMOVE,
-        )
-    return count
+        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+    return len(blocks)
 
 
-def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive, regular_body_size: float | None) -> int:
+def write_translation(
+    page: fitz.Page,
+    block: TextBlock,
+    translated: str,
+    archive: fitz.Archive,
+    regular_body_size: float | None,
+    line_height: float,
+) -> int:
     rect = fitz.Rect(block.rect)
     html_text = styled_html(translated, block)
-    font_size = estimate_font_size(rect, translated, block, regular_body_size)
-    layout_calls = 0
-    while font_size >= MIN_FONT_SIZE:
-        layout_calls += 1
-        css = textbox_css(font_size, block.align)
-        spare_height, _ = page.insert_htmlbox(
-            rect,
-            html_text,
-            css=css,
-            archive=archive,
-            scale_low=1,
-            overlay=True,
-        )
-        if spare_height >= 0:
-            return layout_calls
-        font_size -= 0.5
-
-    layout_calls += 1
-    css = textbox_css(MIN_FONT_SIZE, block.align)
+    font_size = estimate_font_size(rect, translated, block, regular_body_size, line_height)
+    css = textbox_css(font_size, block.align, line_height)
     page.insert_htmlbox(
         rect,
         html_text,
@@ -1045,23 +1076,31 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str, archiv
         scale_low=0.4,
         overlay=True,
     )
-    return layout_calls
+    return 1
 
 
-def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: list[str], output_path: Path, logger: Logger = None) -> None:
+def build_pdf(
+    source_doc: fitz.Document,
+    pages: list[PageData],
+    translations: list[str],
+    output_path: Path,
+    logger: Logger = None,
+    line_height: float = DEFAULT_TEXT_LINE_HEIGHT,
+) -> None:
     output = fitz.open()
     output.insert_pdf(source_doc)
     translation_index = 0
     total_blocks = sum(len(page_data.blocks) for page_data in pages)
     processed_blocks = 0
-    redacted_blocks = 0
+    covered_blocks = 0
     layout_calls = 0
     render_start = time.perf_counter()
     archive = fitz.Archive(FONT_DIR)
     regular_body_size = body_font_size(pages, find_references_range(pages))
 
     if logger:
-        logger.write(f"  typesetting PDF: writing {total_blocks} translated blocks...")
+        logger.write(f"  typesetting PDF: checking {total_blocks} extracted text blocks...")
+        logger.write(f"  typesetting: line height {line_height:g}")
         if regular_body_size:
             logger.write(f"  typesetting: regular body font size {regular_body_size:g}pt")
 
@@ -1075,17 +1114,18 @@ def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: li
                 continue
             page_translations.append((block, translated))
 
-        redacted_blocks += redact_original_text(target_page, [block for block, _ in page_translations])
+        covered_blocks += cover_original_text(target_page, [block for block, _ in page_translations])
         for block, translated in page_translations:
-            layout_calls += write_translation(target_page, block, translated, archive, regular_body_size)
+            layout_calls += write_translation(target_page, block, translated, archive, regular_body_size, line_height)
             processed_blocks += 1
             if logger and processed_blocks % 10 == 0:
-                logger.write(f"    typesetting: rendered {processed_blocks}/{total_blocks} blocks...")
+                logger.write(f"    typesetting: rendered {processed_blocks} changed blocks...")
 
     if logger:
         render_seconds = time.perf_counter() - render_start
         logger.write(
-            f"  typesetting: redacted {redacted_blocks} source blocks and rendered {processed_blocks} changed blocks in "
+            f"  typesetting: {total_blocks} extracted blocks checked; {covered_blocks} changed source blocks covered and "
+            f"{processed_blocks} translated blocks rendered in "
             f"{render_seconds:.1f}s ({layout_calls} html layout calls)"
         )
         logger.write("  typesetting: saving finalized PDF output...")
@@ -1095,7 +1135,7 @@ def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: li
     if tmp_path.exists():
         tmp_path.unlink()
     save_start = time.perf_counter()
-    output.save(tmp_path, garbage=4, deflate=True)
+    output.save(tmp_path, garbage=0, deflate=False)
     output.close()
     tmp_path.replace(output_path)
     if logger:
@@ -1116,7 +1156,23 @@ def collect_pdfs(paths: list[Path]) -> list[Path]:
     return sorted(dict.fromkeys(path.resolve() for path in pdfs))
 
 
-def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callback=None) -> Path:
+def parse_line_height(value: str) -> float:
+    try:
+        line_height = float(value)
+    except ValueError as exc:
+        raise ValueError("line height must be a number") from exc
+    if not 0.7 <= line_height <= 2.0:
+        raise ValueError("line height must be between 0.7 and 2.0")
+    return line_height
+
+
+def translate_pdf(
+    pdf_path: Path,
+    api_key: str,
+    logger: Logger,
+    progress_callback=None,
+    line_height: float = DEFAULT_TEXT_LINE_HEIGHT,
+) -> Path:
     output_path = output_path_for(pdf_path)
     logger.write()
     logger.write(f"PDF: {pdf_path}")
@@ -1133,8 +1189,8 @@ def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callbac
         if progress_callback and hasattr(progress_callback, "on_pages_extracted"):
             progress_callback.on_pages_extracted(len(pages))
 
-        translations = translate_blocks(pages, api_key, logger, progress_callback)
-        build_pdf(doc, pages, translations, output_path, logger)
+        translations = translate_blocks(pages, api_key, logger, progress_callback, line_height)
+        build_pdf(doc, pages, translations, output_path, logger, line_height)
         logger.write(f"  saved: {output_path}")
         if progress_callback and hasattr(progress_callback, "on_done"):
             progress_callback.on_done(output_path)
@@ -1150,7 +1206,19 @@ def translate_pdf(pdf_path: Path, api_key: str, logger: Logger, progress_callbac
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate PDFs from original_PDF to processed_PDF.")
     parser.add_argument("paths", nargs="*", type=Path, help="PDF files or directories. Defaults to original_PDF.")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--line-height",
+        type=parse_line_height,
+        default=None,
+        help=f"Typesetting line height multiplier. Defaults to {DEFAULT_TEXT_LINE_HEIGHT:g}; can also be set with {TYPESETTING_LINE_HEIGHT_ENV}.",
+    )
+    args = parser.parse_args(argv)
+    if args.line_height is None:
+        try:
+            args.line_height = parse_line_height(os.getenv(TYPESETTING_LINE_HEIGHT_ENV, str(DEFAULT_TEXT_LINE_HEIGHT)))
+        except ValueError as exc:
+            parser.error(f"{TYPESETTING_LINE_HEIGHT_ENV}: {exc}")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1169,13 +1237,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         logger.write(f"Found {len(pdfs)} PDF file(s).")
+        logger.write(f"Typesetting line height: {args.line_height:g}")
         failed = []
-        for pdf_path in pdfs:
-            try:
-                translate_pdf(pdf_path, api_key, logger)
-            except Exception as exc:
-                failed.append((pdf_path, exc))
-                logger.write(f"FAILED: {pdf_path}: {exc}")
+        workers = min(MAX_CONCURRENT_PDFS, len(pdfs))
+        logger.write(f"PDF workers: {workers}, global LLM request limit: {MAX_CONCURRENT_BATCHES}")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(translate_pdf, pdf_path, api_key, logger, None, args.line_height): pdf_path
+                for pdf_path in pdfs
+            }
+            for future in as_completed(futures):
+                pdf_path = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    failed.append((pdf_path, exc))
+                    logger.write(f"FAILED: {pdf_path}: {exc}")
 
         logger.write()
         logger.write(f"Done. succeeded: {len(pdfs) - len(failed)}, failed: {len(failed)}")
