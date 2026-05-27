@@ -27,7 +27,7 @@ SILICONFLOW_MODEL = "tencent/Hunyuan-MT-7B"
 TRANSLATE_API_KEY_ENV = "siliconflow_TRANSLATE_API_KEY"
 TARGET_LANGUAGE = "zh-CN"
 CJK_REGULAR_FONT = "C:/Windows/Fonts/STSONG.TTF"
-CJK_BOLD_FONT = "C:/Windows/Fonts/simsunb.ttf"
+CJK_BOLD_FONT = "C:/Windows/Fonts/msyhbd.ttc"
 TIMES_FONT = "C:/Windows/Fonts/times.ttf"
 TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
@@ -42,6 +42,7 @@ FONT_FACE_CSS = f"""
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
 """
 MIN_FONT_SIZE = 4.5
+TEXT_LINE_HEIGHT = 1.0
 MAX_CONCURRENT_BATCHES = 12
 MAX_BATCH_ITEMS = 6
 MAX_BATCH_CHARS = 4000
@@ -517,6 +518,33 @@ def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int,
     return should_translate(block.text)
 
 
+def is_regular_body_block(page: PageData, block: TextBlock, references_start: tuple[int, float, int, float] | None) -> bool:
+    rect = fitz.Rect(block.rect)
+    return (
+        is_body_block(page, block, references_start)
+        and block.align == "left"
+        and not block.bold
+        and not block.italic
+        and not block.leading_bold
+        and block.line_count >= 2
+        and rect.width >= 170
+        and 6 <= block.font_size <= 12
+    )
+
+
+def body_font_size(pages: list[PageData], references_start: tuple[int, float, int, float] | None) -> float | None:
+    sizes = [
+        block.font_size
+        for page in pages
+        for block in page.blocks
+        if is_regular_body_block(page, block, references_start)
+    ]
+    if not sizes:
+        return None
+    sizes.sort()
+    return round(sizes[len(sizes) // 2] * 2) / 2
+
+
 def translation_batches(items: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
     batches = []
     batch = []
@@ -615,11 +643,19 @@ def split_translation(text: str, blocks: list[TextBlock]) -> list[str]:
     if len(blocks) == 1:
         return [text]
 
-    total = sum(max(1, len(block.text)) for block in blocks)
+    capacities = []
+    for block in blocks:
+        rect = fitz.Rect(block.rect)
+        chars_per_line = max(1, int(rect.width / (block.font_size * 0.95)))
+        lines = max(1, int(rect.height / (block.font_size * TEXT_LINE_HEIGHT)))
+        capacities.append(chars_per_line * lines)
+    total = sum(capacities)
     parts = []
     start = 0
-    for block in blocks[:-1]:
-        target = start + round(len(text) * max(1, len(block.text)) / total)
+    used_capacity = 0
+    for capacity in capacities[:-1]:
+        used_capacity += capacity
+        target = round(len(text) * used_capacity / total)
         split_at = text.rfind("。", start, target + 20)
         if split_at == -1 or split_at <= start:
             split_at = text.rfind("，", start, target + 15)
@@ -842,6 +878,27 @@ def html_fragments(text: str) -> str:
     return "".join(parts)
 
 
+def markdown_bold_segments(text: str) -> list[tuple[str, bool]]:
+    segments = []
+    current = []
+    bold = False
+    index = 0
+    while index < len(text):
+        if text.startswith("**", index):
+            if current:
+                segments.append(("".join(current), bold))
+                current = []
+            bold = not bold
+            index += 2
+            continue
+        current.append(text[index])
+        index += 1
+
+    if current:
+        segments.append(("".join(current), bold))
+    return segments
+
+
 def style_class(block: TextBlock) -> str:
     if block.bold and block.italic:
         return "bolditalic"
@@ -868,23 +925,31 @@ def leading_style_end(text: str) -> int:
     return 0
 
 
+def bold_style(base_style: str) -> str:
+    if base_style == "italic":
+        return "bolditalic"
+    return base_style if base_style in {"bold", "bolditalic"} else "bold"
+
+
+def styled_text(text: str, base_style: str) -> str:
+    return "".join(
+        f'<span class="{bold_style(base_style) if bold else base_style}">{html_fragments(segment)}</span>'
+        for segment, bold in markdown_bold_segments(text)
+        if segment
+    )
+
+
 def styled_html(text: str, block: TextBlock) -> str:
     if block.leading_bold:
         end = leading_style_end(text)
         if end:
             heading = text[:end]
             rest = text[end:]
-            return (
-                f'<span class="bold">{html_fragments(heading)}</span>'
-                f'<span class="regular">{html_fragments(rest)}</span>'
-            )
+            return styled_text(heading, "bold") + styled_text(rest, "regular")
     if block.leading_bold and "。" in text:
         heading, rest = text.split("。", 1)
-        return (
-            f'<span class="bold">{html_fragments(heading + "。")}</span>'
-            f'<span class="regular">{html_fragments(rest)}</span>'
-        )
-    return f'<span class="{style_class(block)}">{html_fragments(text)}</span>'
+        return styled_text(heading + "。", "bold") + styled_text(rest, "regular")
+    return styled_text(text, style_class(block))
 
 
 def clean_translation(text: str) -> str:
@@ -896,7 +961,7 @@ def clean_translation(text: str) -> str:
 def textbox_css(font_size: float, align: str) -> str:
     return f"""
 {FONT_FACE_CSS}
-body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; text-align: {align}; }}
+body {{ margin: 0; font-size: {font_size}pt; line-height: {TEXT_LINE_HEIGHT}; text-align: {align}; }}
 .cjk {{ font-family: CjkRegularLocal; }}
 .latin {{ font-family: TimesLocal; }}
 .bold .cjk {{ font-family: CjkBoldLocal; }}
@@ -908,25 +973,52 @@ body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; text-align: {ali
 """
 
 
-def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock) -> float:
+def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_body_size: float | None) -> float:
     limit = 18.0 if (block.align == "center" or block.bold or block.line_count <= 2) else 10.0
-    size = min(block.font_size, limit)
-    while size > MIN_FONT_SIZE:
-        chars_per_line = max(1, int(rect.width / (size * 0.95)))
-        line_count = (len(text) + chars_per_line - 1) // chars_per_line
-        if line_count * size * 1.2 <= rect.height:
-            return size
-        size -= 0.5
-    return MIN_FONT_SIZE
+    source_size = (
+        regular_body_size
+        if regular_body_size
+        and block.align == "left"
+        and not block.bold
+        and not block.italic
+        and not block.leading_bold
+        and block.line_count >= 2
+        and rect.width >= 170
+        and 6 <= block.font_size <= 12
+        else block.font_size
+    )
+    size = min(source_size, limit)
+    chars_per_line = max(1, int(rect.width / (size * 0.9)))
+    line_count = (len(text) + chars_per_line - 1) // chars_per_line
+    if line_count * size * TEXT_LINE_HEIGHT > rect.height * 1.35:
+        while size > MIN_FONT_SIZE:
+            chars_per_line = max(1, int(rect.width / (size * 0.9)))
+            line_count = (len(text) + chars_per_line - 1) // chars_per_line
+            if line_count * size * TEXT_LINE_HEIGHT <= rect.height * 1.2:
+                return size
+            size -= 0.5
+    return size
 
 
-def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive) -> int:
+def redact_original_text(page: fitz.Page, blocks: list[TextBlock]) -> int:
+    count = 0
+    for block in blocks:
+        rect = fitz.Rect(block.rect) + (-0.8, -0.8, 0.8, 0.8)
+        page.add_redact_annot(rect, fill=(1, 1, 1), cross_out=False)
+        count += 1
+    if count:
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+    return count
+
+
+def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive, regular_body_size: float | None) -> int:
     rect = fitz.Rect(block.rect)
-    cover = rect + (-0.8, -0.8, 0.8, 0.8)
-    page.draw_rect(cover, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
-
     html_text = styled_html(translated, block)
-    font_size = estimate_font_size(rect, translated, block)
+    font_size = estimate_font_size(rect, translated, block, regular_body_size)
     layout_calls = 0
     while font_size >= MIN_FONT_SIZE:
         layout_calls += 1
@@ -936,7 +1028,7 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str, archiv
             html_text,
             css=css,
             archive=archive,
-            scale_low=0.55,
+            scale_low=1,
             overlay=True,
         )
         if spare_height >= 0:
@@ -962,21 +1054,30 @@ def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: li
     translation_index = 0
     total_blocks = sum(len(page_data.blocks) for page_data in pages)
     processed_blocks = 0
+    redacted_blocks = 0
     layout_calls = 0
     render_start = time.perf_counter()
     archive = fitz.Archive(FONT_DIR)
+    regular_body_size = body_font_size(pages, find_references_range(pages))
 
     if logger:
         logger.write(f"  typesetting PDF: writing {total_blocks} translated blocks...")
+        if regular_body_size:
+            logger.write(f"  typesetting: regular body font size {regular_body_size:g}pt")
 
     for page_data in pages:
         target_page = output[page_data.index]
+        page_translations = []
         for block in page_data.blocks:
             translated = translations[translation_index]
             translation_index += 1
             if translated == block.text:
                 continue
-            layout_calls += write_translation(target_page, block, translated, archive)
+            page_translations.append((block, translated))
+
+        redacted_blocks += redact_original_text(target_page, [block for block, _ in page_translations])
+        for block, translated in page_translations:
+            layout_calls += write_translation(target_page, block, translated, archive, regular_body_size)
             processed_blocks += 1
             if logger and processed_blocks % 10 == 0:
                 logger.write(f"    typesetting: rendered {processed_blocks}/{total_blocks} blocks...")
@@ -984,7 +1085,7 @@ def build_pdf(source_doc: fitz.Document, pages: list[PageData], translations: li
     if logger:
         render_seconds = time.perf_counter() - render_start
         logger.write(
-            f"  typesetting: rendered {processed_blocks} changed blocks in "
+            f"  typesetting: redacted {redacted_blocks} source blocks and rendered {processed_blocks} changed blocks in "
             f"{render_seconds:.1f}s ({layout_calls} html layout calls)"
         )
         logger.write("  typesetting: saving finalized PDF output...")
