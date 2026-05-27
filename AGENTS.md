@@ -2,13 +2,6 @@
 
 基于 OpenDataLoader PDF 开源项目打造，目标替代小绿鲸的 PDF 翻译工具。
 
-## Environment
-
-- API key: `GOOGLE_TRANSLATE_API_KEY` in `d:\Work\auto_PDF_translate\.env`
-- Translation API: Cloud Translation v2 (Basic)，不要使用 v3
-- 语言: Python（API 调用和 PDF 处理都默认使用 Python）
-- 参考文档: Cloud Translation API 官方文档在 `docs/`，实现翻译功能时参考这些示例
-
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
@@ -81,7 +74,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ### 5. Project Structure
 
-- `rsc/` contains Python source code. The main PDF translation workflow currently lives in `rsc/translate_pdf.py`.
+- `rsc/` contains Python source code. The main PDF translation workflow lives in `rsc/translate_pdf.py`, and the FastAPI web server for local workbench API lives in `rsc/web_app.py`.
+- `my-react-app/` contains the React-based frontend web workbench for file upload, translation job queues, event-driven log monitoring, and synchronized dual-column PDF preview.
 - `original_PDF/` contains source PDFs waiting to be translated. Keep the directory with `.gitkeep` when it has no committed inputs.
 - `processed_PDF/` contains generated translated PDFs. Treat these as output artifacts unless the task explicitly asks to keep or review a generated sample.
 - `docs/` contains local reference material for OpenDataLoader PDF and Cloud Translation API. Consult it before changing translation behavior or API usage.
