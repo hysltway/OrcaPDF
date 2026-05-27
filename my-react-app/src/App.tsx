@@ -97,8 +97,9 @@ function App() {
   const originalPdfUrl = activeJob
     ? `/api/files/original/${encodeURIComponent(activeJob.filename)}`
     : null;
-  const translatedPdfUrl = activeJob?.translated_path
-    ? `/api/files/translated/${encodeURIComponent(activeJob.translated_path.split(/[\\/]/).pop() || '')}`
+  const translatedPdfName = activeJob?.translated_path?.split(/[\\/]/).pop() || '';
+  const translatedPdfUrl = translatedPdfName
+    ? `/api/files/translated/${encodeURIComponent(translatedPdfName)}`
     : null;
 
   const fetchJobs = useCallback(async () => {
@@ -163,7 +164,7 @@ function App() {
     return () => {
       eventSource.close();
     };
-  }, [activeJobId]);
+  }, [activeJobId, jobEventVersion]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -309,7 +310,17 @@ function App() {
 
     try {
       const res = await fetch(`/api/jobs/${activeJob.id}/retranslate`, { method: 'POST' });
-      if (!res.ok) return;
+      if (!res.ok) {
+        const message = await res.text();
+        setJobs((prev) =>
+          prev.map((job) =>
+            job.id === activeJob.id
+              ? { ...job, status: 'failed', error: message || 'Retranslation request failed' }
+              : job,
+          ),
+        );
+        return;
+      }
 
       const job: Job = await res.json();
       setJobs((prev) => mergeJobs(prev, [job]));
@@ -557,7 +568,7 @@ function App() {
                   <span>{totalPages || 1} PAGES</span>
                 </div>
                 <div className="pdf-viewport" ref={rightViewportRef} onScroll={handleRightScroll}>
-                  {activeJob.status === 'done' && translatedPdfUrl ? (
+                  {activeJob.status === 'done' && translatedPdfUrl && translatedPdfName ? (
                     <Document
                       file={translatedPdfUrl}
                       className="pdf-document"
@@ -570,7 +581,8 @@ function App() {
                       error={
                         <div className="watermark-overlay">
                           <AlertCircle size={40} />
-                          <p>译文 PDF 加载失败</p>
+                          <h3>译文 PDF 读取失败</h3>
+                          <p>服务器已生成 {translatedPdfName}，但浏览器无法打开。请重新翻译，或检查文件是否损坏。</p>
                         </div>
                       }
                     >
@@ -578,11 +590,23 @@ function App() {
                         <Page key={page} pageNumber={page} scale={scale} className="pdf-page-shadow" />
                       ))}
                     </Document>
+                  ) : activeJob.status === 'failed' ? (
+                    <div className="watermark-overlay">
+                      <AlertCircle size={40} />
+                      <h3>翻译失败，未生成译文 PDF</h3>
+                      <p>{activeJob.error || '查看左侧日志中的 CRITICAL ERROR，修正后可重新翻译。'}</p>
+                    </div>
+                  ) : activeJob.status === 'done' ? (
+                    <div className="watermark-overlay">
+                      <AlertCircle size={40} />
+                      <h3>任务已完成，但没有译文文件路径</h3>
+                      <p>后端没有返回译文 PDF 文件名。请刷新任务列表；如果仍然缺失，请重新翻译。</p>
+                    </div>
                   ) : (
                     <div className="watermark-overlay">
                       <BookOpen size={40} />
-                      <h3>译文预览</h3>
-                      <p>译文 PDF 可用后在此显示；任务详情集中在左侧监控区。</p>
+                      <h3>{activeJob.status === 'queued' ? '译文尚未开始生成' : '正在翻译，译文 PDF 尚未生成'}</h3>
+                      <p>翻译和排版全部完成后，这里会显示中文译文 PDF；当前进度见左侧监控区。</p>
                     </div>
                   )}
                 </div>

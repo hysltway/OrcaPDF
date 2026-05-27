@@ -44,7 +44,7 @@ FONT_FACE_CSS = f"""
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
 """
 MIN_FONT_SIZE = 4.5  # 翻译回写 PDF 时的最小字号限制（防止文字缩得过小无法阅读）
-DEFAULT_TEXT_LINE_HEIGHT = 1.0  # 排版时默认的文本行高
+DEFAULT_TEXT_LINE_HEIGHT = 1.2  # 排版时默认的文本行高
 MAX_CONCURRENT_BATCHES = 128  # 允许并发提交到大模型翻译的批次（Batch）上限
 MAX_BATCH_ITEMS = 1  # 每个翻译批次中包含的文本单元（Unit）数量最大值
 MAX_BATCH_CHARS = 12000  # 每个翻译批次所允许的最大字符长度限制

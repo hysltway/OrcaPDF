@@ -50,6 +50,14 @@ python rsc\translate_pdf.py original_PDF\paper.pdf
 python rsc\translate_pdf.py original_PDF
 ```
 
+排版行间距默认是 `1.0`，可通过命令行参数调整：
+
+```powershell
+python rsc\translate_pdf.py --line-height 1.15 original_PDF\paper.pdf
+```
+
+使用 Web 工作台时，可在 `.env` 中设置 `PDF_TRANSLATE_LINE_HEIGHT=1.15`。
+
 输出文件会生成到 `processed_PDF/`，文件名格式为：
 
 ```text

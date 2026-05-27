@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import queue
@@ -8,6 +9,7 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
 
@@ -20,14 +22,72 @@ from fastapi.staticfiles import StaticFiles
 from rsc.translate_pdf import (
     Logger,
     OUTPUT_DIR,
+    DEFAULT_TEXT_LINE_HEIGHT,
     ROOT,
     SOURCE_DIR,
     TARGET_LANGUAGE,
+    TYPESETTING_LINE_HEIGHT_ENV,
     TRANSLATE_API_KEY_ENV,
+    MAX_CONCURRENT_PDFS,
+    parse_line_height,
     translate_pdf,
 )
 
-app = FastAPI(title="PDF Translation Workbench API")
+
+class PdfRangeAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+
+        _, method, path, _, status_code = args[:5]
+        try:
+            status = int(status_code)
+        except (TypeError, ValueError):
+            return True
+
+        if method != "GET" or status != 206:
+            return True
+
+        return not str(path).startswith(("/api/files/original/", "/api/files/translated/"))
+
+
+def install_access_log_filter() -> None:
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, PdfRangeAccessLogFilter) for existing in logger.filters):
+        logger.addFilter(PdfRangeAccessLogFilter())
+
+
+def install_connection_reset_filter() -> None:
+    loop = asyncio.get_running_loop()
+    if getattr(loop, "_pdf_translate_connection_reset_filter", False):
+        return
+
+    previous_handler = loop.get_exception_handler()
+
+    def handle_exception(event_loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, ConnectionResetError) and getattr(exc, "winerror", None) == 10054:
+            return
+
+        if previous_handler:
+            previous_handler(event_loop, context)
+        else:
+            event_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_exception)
+    setattr(loop, "_pdf_translate_connection_reset_filter", True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    install_connection_reset_filter()
+    yield
+
+
+install_access_log_filter()
+
+app = FastAPI(title="PDF Translation Workbench API", lifespan=lifespan)
 mimetypes.add_type("application/javascript", ".mjs")
 
 # Enable CORS for local development
@@ -229,6 +289,13 @@ class JobProgressCallback:
 def worker_thread_func():
     load_dotenv(ROOT / ".env")
     api_key = os.getenv(TRANSLATE_API_KEY_ENV)
+    try:
+        line_height = parse_line_height(os.getenv(TYPESETTING_LINE_HEIGHT_ENV, str(DEFAULT_TEXT_LINE_HEIGHT)))
+    except ValueError as exc:
+        line_height = DEFAULT_TEXT_LINE_HEIGHT
+        line_height_error = f"{TYPESETTING_LINE_HEIGHT_ENV}: {exc}"
+    else:
+        line_height_error = None
 
     while True:
         try:
@@ -250,9 +317,11 @@ def worker_thread_func():
                 try:
                     if not api_key:
                         raise ValueError(f"{TRANSLATE_API_KEY_ENV} not found in .env")
+                    if line_height_error:
+                        raise ValueError(line_height_error)
 
                     pdf_path = Path(job["original_path"])
-                    translate_pdf(pdf_path, api_key, logger, progress_callback=cb)
+                    translate_pdf(pdf_path, api_key, logger, progress_callback=cb, line_height=line_height)
                 finally:
                     logger.close()
                     if job_log_path.exists():
@@ -274,9 +343,13 @@ def worker_thread_func():
             time.sleep(1)
 
 
-# Start background worker thread
-worker_thread = threading.Thread(target=worker_thread_func, daemon=True)
-worker_thread.start()
+# Start background worker threads
+worker_threads = [
+    threading.Thread(target=worker_thread_func, daemon=True)
+    for _ in range(MAX_CONCURRENT_PDFS)
+]
+for worker_thread in worker_threads:
+    worker_thread.start()
 
 
 async def event_generator(job_id: str):
@@ -407,16 +480,12 @@ async def retranslate_job(id: str):
         if not source_path.is_file():
             raise HTTPException(status_code=404, detail="Original file not found")
 
-        translated_path = output_path_for_source_name(job["filename"])
         job["status"] = "queued"
         job["translated_path"] = None
         job["progress"] = new_progress()
         job["logs"] = [f"Retranslation queued for: {job['filename']}"]
         job["error"] = None
         job["created_at"] = time.time()
-
-    if translated_path.exists():
-        translated_path.unlink()
 
     job_queue.put(id)
 
