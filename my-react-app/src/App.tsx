@@ -1,11 +1,9 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   BookOpen,
   ChevronDown,
   ChevronUp,
-  ChevronsLeft,
-  ChevronsRight,
   FileText,
   GripVertical,
   Link,
@@ -71,7 +69,7 @@ function formatCreatedAt(timestamp: number) {
 function App() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'all' | 'queued' | 'running' | 'done' | 'failed'>('all');
+  const [jobEventVersion, setJobEventVersion] = useState(0);
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isMonitorCollapsed, setIsMonitorCollapsed] = useState(false);
@@ -79,8 +77,8 @@ function App() {
 
   const [isSyncScroll, setIsSyncScroll] = useState(true);
   const [scale, setScale] = useState(1.1);
-  const [pageNumber, setPageNumber] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [autoMonitorJobId, setAutoMonitorJobId] = useState<string | null>(null);
 
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -95,6 +93,7 @@ function App() {
   const isSyncingRight = useRef(false);
 
   const activeJob = jobs.find((job) => job.id === activeJobId) || null;
+  const pageNumbers = useMemo(() => Array.from({ length: totalPages }, (_, index) => index + 1), [totalPages]);
   const originalPdfUrl = activeJob
     ? `/api/files/original/${encodeURIComponent(activeJob.filename)}`
     : null;
@@ -110,7 +109,6 @@ function App() {
         setJobs(data);
 
         if (data.length > 0 && (!activeJobId || !data.some((job) => job.id === activeJobId))) {
-          setPageNumber(1);
           setTotalPages(1);
           setActiveJobId(data[0].id);
         }
@@ -118,7 +116,7 @@ function App() {
     } catch (err) {
       console.error('Failed to fetch jobs:', err);
     }
-  }, [activeJobId]);
+  }, [activeJobId, jobEventVersion]);
 
   useEffect(() => {
     queueMicrotask(fetchJobs);
@@ -170,6 +168,32 @@ function App() {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [activeJob?.logs.length, isMonitorCollapsed]);
+
+  useEffect(() => {
+    if (!activeJob || activeJob.id !== autoMonitorJobId) return;
+    if (activeJob.status !== 'done' && activeJob.status !== 'failed') return;
+    setIsMonitorCollapsed(true);
+    setAutoMonitorJobId(null);
+  }, [activeJob, autoMonitorJobId]);
+
+  useEffect(() => {
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      setScale((value) => Math.min(2.5, Math.max(0.6, value + (event.deltaY < 0 ? 0.15 : -0.15))));
+    };
+    const options = { passive: false, capture: true };
+    const leftViewport = leftViewportRef.current;
+    const rightViewport = rightViewportRef.current;
+
+    leftViewport?.addEventListener('wheel', handleWheel, options);
+    rightViewport?.addEventListener('wheel', handleWheel, options);
+
+    return () => {
+      leftViewport?.removeEventListener('wheel', handleWheel, options);
+      rightViewport?.removeEventListener('wheel', handleWheel, options);
+    };
+  }, [activeJobId]);
 
   const handleLeftScroll = () => {
     if (!isSyncScroll) return;
@@ -223,6 +247,11 @@ function App() {
     document.addEventListener('pointerup', handlePointerUp);
   };
 
+  const handleMonitorToggle = () => {
+    setAutoMonitorJobId(null);
+    setIsMonitorCollapsed((collapsed) => !collapsed);
+  };
+
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -264,8 +293,9 @@ function App() {
         const data: Job[] = await res.json();
         setJobs((prev) => mergeJobs(prev, data));
         if (data.length > 0) {
-          setPageNumber(1);
           setTotalPages(1);
+          setAutoMonitorJobId(data[0].id);
+          setIsMonitorCollapsed(false);
           setActiveJobId(data[0].id);
         }
       }
@@ -274,10 +304,23 @@ function App() {
     }
   };
 
-  const filteredJobs = jobs.filter((job) => {
-    if (filter === 'all') return true;
-    return job.status === filter;
-  });
+  const handleRetranslate = async () => {
+    if (!activeJob || activeJob.status === 'queued' || activeJob.status === 'running') return;
+
+    try {
+      const res = await fetch(`/api/jobs/${activeJob.id}/retranslate`, { method: 'POST' });
+      if (!res.ok) return;
+
+      const job: Job = await res.json();
+      setJobs((prev) => mergeJobs(prev, [job]));
+      setActiveJobId(job.id);
+      setJobEventVersion((version) => version + 1);
+      setAutoMonitorJobId(job.id);
+      setIsMonitorCollapsed(false);
+    } catch (err) {
+      console.error('Retranslation failed:', err);
+    }
+  };
 
   const getJobProgressPercent = (job: Job) => {
     if (job.status === 'done' || job.status === 'failed') return 100;
@@ -316,39 +359,17 @@ function App() {
               <p className="subtitle">支持批量 PDF；重复文件会复用已有任务</p>
             </div>
 
-            <div className="job-filters">
-              {(['all', 'queued', 'running', 'done', 'failed'] as const).map((status) => (
-                <button
-                  key={status}
-                  type="button"
-                  className={`filter-btn ${filter === status ? 'active' : ''}`}
-                  onClick={() => setFilter(status)}
-                >
-                  {status === 'all'
-                    ? '全部'
-                    : status === 'queued'
-                      ? '排队'
-                      : status === 'running'
-                        ? '翻译中'
-                        : status === 'done'
-                          ? '完成'
-                          : '失败'}
-                </button>
-              ))}
-            </div>
-
             <div className="job-list">
-              {filteredJobs.length === 0 ? (
-                <div className="job-empty">无对应任务</div>
+              {jobs.length === 0 ? (
+                <div className="job-empty">暂无任务</div>
               ) : (
-                filteredJobs.map((job) => (
+                jobs.map((job) => (
                   <button
                     type="button"
                     key={job.id}
                     className={`job-card ${activeJobId === job.id ? 'active' : ''}`}
                     onClick={() => {
                       if (activeJobId !== job.id) {
-                        setPageNumber(1);
                         setTotalPages(1);
                       }
                       setActiveJobId(job.id);
@@ -361,7 +382,6 @@ function App() {
                       </span>
                     </div>
                     <div className="job-meta">
-                      <span>页数 {job.progress.pages || '-'}</span>
                       <span>{formatCreatedAt(job.created_at)}</span>
                     </div>
                   </button>
@@ -373,7 +393,7 @@ function App() {
               <button
                 type="button"
                 className="monitor-header"
-                onClick={() => setIsMonitorCollapsed((collapsed) => !collapsed)}
+                onClick={handleMonitorToggle}
                 aria-expanded={!isMonitorCollapsed}
               >
                 <span>实时任务状态监控</span>
@@ -453,30 +473,21 @@ function App() {
                 <span className="filename" title={activeJob.filename}>
                   {activeJob.filename}
                 </span>
+                <button
+                  type="button"
+                  className="control-btn title-action"
+                  onClick={handleRetranslate}
+                  disabled={activeJob.status === 'queued' || activeJob.status === 'running'}
+                >
+                  <RefreshCw size={15} />
+                  重新翻译
+                </button>
               </div>
 
               <div className="pdf-controls">
-                <button
-                  type="button"
-                  className="control-btn"
-                  onClick={() => setPageNumber((page) => Math.max(1, page - 1))}
-                  disabled={pageNumber <= 1}
-                >
-                  <ChevronsLeft size={16} />
-                  上一页
-                </button>
                 <span className="page-indicator">
-                  第 {pageNumber} / {totalPages || 1} 页
+                  共 {totalPages || 1} 页
                 </span>
-                <button
-                  type="button"
-                  className="control-btn"
-                  onClick={() => setPageNumber((page) => Math.min(totalPages, page + 1))}
-                  disabled={pageNumber >= totalPages}
-                >
-                  下一页
-                  <ChevronsRight size={16} />
-                </button>
 
                 <button type="button" className="control-btn icon-only" onClick={() => setScale((value) => Math.max(0.6, value - 0.1))}>
                   <ZoomOut size={16} />
@@ -501,7 +512,7 @@ function App() {
               <div className="pdf-panel" style={{ flex: `${leftPanelWidth} 1 0` }}>
                 <div className="panel-header">
                   <span>英文原文</span>
-                  <span>PAGE {pageNumber}</span>
+                  <span>{totalPages || 1} PAGES</span>
                 </div>
                 <div className="pdf-viewport" ref={leftViewportRef} onScroll={handleLeftScroll}>
                   {originalPdfUrl && (
@@ -522,7 +533,9 @@ function App() {
                       }
                       onLoadSuccess={({ numPages }) => setTotalPages(numPages)}
                     >
-                      <Page pageNumber={pageNumber} scale={scale} className="pdf-page-shadow" />
+                      {pageNumbers.map((page) => (
+                        <Page key={page} pageNumber={page} scale={scale} className="pdf-page-shadow" />
+                      ))}
                     </Document>
                   )}
                 </div>
@@ -541,7 +554,7 @@ function App() {
               <div className="pdf-panel" style={{ flex: `${100 - leftPanelWidth} 1 0` }}>
                 <div className="panel-header">
                   <span>中文译文</span>
-                  <span>PAGE {pageNumber}</span>
+                  <span>{totalPages || 1} PAGES</span>
                 </div>
                 <div className="pdf-viewport" ref={rightViewportRef} onScroll={handleRightScroll}>
                   {activeJob.status === 'done' && translatedPdfUrl ? (
@@ -561,7 +574,9 @@ function App() {
                         </div>
                       }
                     >
-                      <Page pageNumber={pageNumber} scale={scale} className="pdf-page-shadow" />
+                      {pageNumbers.map((page) => (
+                        <Page key={page} pageNumber={page} scale={scale} className="pdf-page-shadow" />
+                      ))}
                     </Document>
                   ) : (
                     <div className="watermark-overlay">

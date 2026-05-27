@@ -395,6 +395,34 @@ async def get_job(id: str):
         return job
 
 
+@app.post("/api/jobs/{id}/retranslate")
+async def retranslate_job(id: str):
+    with jobs_lock:
+        job = jobs.get(id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        source_path = Path(job["original_path"])
+        if not source_path.is_file():
+            raise HTTPException(status_code=404, detail="Original file not found")
+
+        translated_path = output_path_for_source_name(job["filename"])
+        job["status"] = "queued"
+        job["translated_path"] = None
+        job["progress"] = new_progress()
+        job["logs"] = [f"Retranslation queued for: {job['filename']}"]
+        job["error"] = None
+        job["created_at"] = time.time()
+
+    if translated_path.exists():
+        translated_path.unlink()
+
+    job_queue.put(id)
+
+    with jobs_lock:
+        return jobs[id]
+
+
 @app.get("/api/jobs/{id}/events")
 async def get_job_events(id: str):
     with jobs_lock:

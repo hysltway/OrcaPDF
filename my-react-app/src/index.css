@@ -215,38 +215,6 @@ button {
   font-weight: 500;
 }
 
-.job-filters {
-  display: flex;
-  padding: 0 14px 12px;
-  gap: 6px;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.filter-btn {
-  flex: 1;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-color);
-  color: var(--text-secondary);
-  padding: 5px 4px;
-  border-radius: 6px;
-  font-size: 0.75rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-  white-space: nowrap;
-}
-
-.filter-btn:hover {
-  background-color: var(--bg-muted);
-  color: var(--text-primary);
-}
-
-.filter-btn.active {
-  background-color: var(--bg-strong);
-  color: var(--text-inverse);
-  border-color: var(--bg-strong);
-}
-
 .job-list {
   flex: 1;
   min-height: 0;
@@ -314,7 +282,7 @@ button {
   font-size: 0.75rem;
   color: var(--text-muted);
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
 }
 
@@ -539,6 +507,13 @@ button {
   justify-content: center;
 }
 
+.control-btn.title-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 9px;
+  font-size: 0.76rem;
+}
+
 .control-btn:hover:not(:disabled) {
   background-color: var(--bg-muted);
   border-color: var(--border-strong);
@@ -697,6 +672,10 @@ input:checked + .slider::before {
 
 .pdf-document {
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
 }
 
 .pdf-page-shadow {
@@ -717,7 +696,9 @@ input:checked + .slider::before {
   align-items: center;
   justify-content: center;
   gap: 14px;
-  height: 100%;
+  position: absolute;
+  inset: 0;
+  min-height: 100%;
   width: 100%;
   color: var(--text-secondary);
   text-align: center;

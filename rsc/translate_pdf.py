@@ -23,22 +23,23 @@ LOG_PATH = ROOT / "_translate_log.txt"
 
 TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 TARGET_LANGUAGE = "zh-CN"
-SIMSUN_FONT = "C:/Windows/Fonts/simsun.ttc"
-SIMSUN_BOLD_FONT = "C:/Windows/Fonts/simsunb.ttf"
+CJK_REGULAR_FONT = "C:/Windows/Fonts/STSONG.TTF"
+CJK_BOLD_FONT = "C:/Windows/Fonts/simsunb.ttf"
 TIMES_FONT = "C:/Windows/Fonts/times.ttf"
 TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
 TIMES_BOLD_ITALIC_FONT = "C:/Windows/Fonts/timesbi.ttf"
-FONT_DIR = str(Path(SIMSUN_FONT).parent)
+FONT_DIR = str(Path(CJK_REGULAR_FONT).parent)
 FONT_FACE_CSS = f"""
-@font-face {{ font-family: SimSunLocal; src: url({Path(SIMSUN_FONT).name}); }}
-@font-face {{ font-family: SimSunBoldLocal; src: url({Path(SIMSUN_BOLD_FONT).name}); }}
+@font-face {{ font-family: CjkRegularLocal; src: url({Path(CJK_REGULAR_FONT).name}); }}
+@font-face {{ font-family: CjkBoldLocal; src: url({Path(CJK_BOLD_FONT).name}); }}
 @font-face {{ font-family: TimesLocal; src: url({Path(TIMES_FONT).name}); }}
 @font-face {{ font-family: TimesBoldLocal; src: url({Path(TIMES_BOLD_FONT).name}); }}
 @font-face {{ font-family: TimesItalicLocal; src: url({Path(TIMES_ITALIC_FONT).name}); }}
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
 """
 MIN_FONT_SIZE = 4.5
+IMAGE_RENDER_SCALE = 2
 MAX_CONCURRENT_BATCHES = 8
 MAX_BATCH_ITEMS = 80
 MAX_BATCH_CHARS = 24000
@@ -782,13 +783,13 @@ def textbox_css(font_size: float, align: str) -> str:
     return f"""
 {FONT_FACE_CSS}
 body {{ margin: 0; font-size: {font_size}pt; line-height: 1.15; text-align: {align}; }}
-.cjk {{ font-family: SimSunLocal; }}
+.cjk {{ font-family: CjkRegularLocal; }}
 .latin {{ font-family: TimesLocal; }}
-.bold .cjk {{ font-family: SimSunBoldLocal; }}
+.bold .cjk {{ font-family: CjkBoldLocal; }}
 .bold .latin {{ font-family: TimesBoldLocal; }}
-.italic .cjk {{ font-family: SimSunLocal; font-style: italic; }}
+.italic .cjk {{ font-family: CjkRegularLocal; font-style: italic; }}
 .italic .latin {{ font-family: TimesItalicLocal; }}
-.bolditalic .cjk {{ font-family: SimSunBoldLocal; font-style: italic; }}
+.bolditalic .cjk {{ font-family: CjkBoldLocal; font-style: italic; }}
 .bolditalic .latin {{ font-family: TimesBoldItalicLocal; }}
 """
 
@@ -805,6 +806,34 @@ def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock) -> float:
     return MIN_FONT_SIZE
 
 
+def render_text_image(rect: fitz.Rect, html_text: str, css: str, archive: fitz.Archive, scale_low: float) -> tuple[float, bytes]:
+    doc = fitz.open()
+    page = doc.new_page(width=rect.width, height=rect.height)
+    spare_height, _ = page.insert_htmlbox(
+        fitz.Rect(0, 0, rect.width, rect.height),
+        html_text,
+        css=css,
+        archive=archive,
+        scale_low=scale_low,
+    )
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(IMAGE_RENDER_SCALE, IMAGE_RENDER_SCALE), alpha=False)
+    image = pixmap.tobytes("png")
+    doc.close()
+    return spare_height, image
+
+
+def insert_text_layer(page: fitz.Page, rect: fitz.Rect, html_text: str, css: str, archive: fitz.Archive, scale_low: float) -> None:
+    page.insert_htmlbox(
+        rect,
+        html_text,
+        css=css,
+        archive=archive,
+        scale_low=scale_low,
+        overlay=True,
+        opacity=0,
+    )
+
+
 def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive) -> int:
     rect = fitz.Rect(block.rect)
     cover = rect + (-0.8, -0.8, 0.8, 0.8)
@@ -815,27 +844,19 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str, archiv
     layout_calls = 0
     while font_size >= MIN_FONT_SIZE:
         layout_calls += 1
-        spare_height, _ = page.insert_htmlbox(
-            rect,
-            html_text,
-            css=textbox_css(font_size, block.align),
-            archive=archive,
-            scale_low=0.55,
-            overlay=True,
-        )
+        css = textbox_css(font_size, block.align)
+        spare_height, image = render_text_image(rect, html_text, css, archive, scale_low=0.55)
         if spare_height >= 0:
+            page.insert_image(rect, stream=image, overlay=True)
+            insert_text_layer(page, rect, html_text, css, archive, scale_low=0.55)
             return layout_calls
         font_size -= 0.5
 
     layout_calls += 1
-    page.insert_htmlbox(
-        rect,
-        html_text,
-        css=textbox_css(MIN_FONT_SIZE, block.align),
-        archive=archive,
-        scale_low=0.4,
-        overlay=True,
-    )
+    css = textbox_css(MIN_FONT_SIZE, block.align)
+    _, image = render_text_image(rect, html_text, css, archive, scale_low=0.4)
+    page.insert_image(rect, stream=image, overlay=True)
+    insert_text_layer(page, rect, html_text, css, archive, scale_low=0.4)
     return layout_calls
 
 
