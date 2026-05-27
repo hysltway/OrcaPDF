@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import re
 import sys
@@ -21,7 +22,9 @@ SOURCE_DIR = ROOT / "original_PDF"
 OUTPUT_DIR = ROOT / "processed_PDF"
 LOG_PATH = ROOT / "_translate_log.txt"
 
-TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
+SILICONFLOW_CHAT_URL = "https://api.siliconflow.cn/v1/chat/completions"
+SILICONFLOW_MODEL = "tencent/Hunyuan-MT-7B"
+TRANSLATE_API_KEY_ENV = "siliconflow_TRANSLATE_API_KEY"
 TARGET_LANGUAGE = "zh-CN"
 CJK_REGULAR_FONT = "C:/Windows/Fonts/STSONG.TTF"
 CJK_BOLD_FONT = "C:/Windows/Fonts/simsunb.ttf"
@@ -39,10 +42,9 @@ FONT_FACE_CSS = f"""
 @font-face {{ font-family: TimesBoldItalicLocal; src: url({Path(TIMES_BOLD_ITALIC_FONT).name}); }}
 """
 MIN_FONT_SIZE = 4.5
-IMAGE_RENDER_SCALE = 2
-MAX_CONCURRENT_BATCHES = 8
-MAX_BATCH_ITEMS = 80
-MAX_BATCH_CHARS = 24000
+MAX_CONCURRENT_BATCHES = 12
+MAX_BATCH_ITEMS = 6
+MAX_BATCH_CHARS = 4000
 
 
 @dataclass(slots=True)
@@ -629,34 +631,140 @@ def split_translation(text: str, blocks: list[TextBlock]) -> list[str]:
     return parts
 
 
+def translation_prompt(batch: list[tuple[int, str]]) -> str:
+    return json.dumps(
+        [{"id": unit_index, "text": text} for unit_index, text in batch],
+        ensure_ascii=False,
+    )
+
+
+def parse_translation_response(text: str) -> dict[int, str]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    payload = json.loads(text)
+    translations = payload["translations"] if isinstance(payload, dict) else payload
+    return {
+        int(item["id"]): clean_translation(str(item["text"]))
+        for item in translations
+    }
+
+
 def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
-    data = [("target", TARGET_LANGUAGE), ("format", "text")]
-    data.extend(("q", text) for _, text in batch)
+    total_chars = sum(len(text) for _, text in batch)
+    payload = {
+        "model": SILICONFLOW_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are translating academic PDF text from English into Simplified Chinese. "
+                    "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
+                    "Preserve terminology consistency, proper nouns, model names, dataset names, citations, numbers, "
+                    "units, formulas, inline variables, punctuation that belongs to equations, and bracketed references. "
+                    "Return only valid JSON in this exact shape: "
+                    "{\"translations\":[{\"id\":number,\"text\":\"translated Chinese\"}]}. "
+                    "Return every input id exactly once. Do not translate JSON keys or ids."
+                ),
+            },
+            {
+                "role": "user",
+                "content": translation_prompt(batch),
+            },
+        ],
+        "max_tokens": max(1024, min(8192, total_chars * 2)),
+        "temperature": 0.1,
+        "top_p": 0.7,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
     with requests.Session() as session:
         for attempt in range(1, 4):
             try:
                 response = session.post(
-                    TRANSLATE_URL,
-                    params={"key": api_key},
-                    data=data,
-                    timeout=60,
+                    SILICONFLOW_CHAT_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=45,
                 )
                 if response.status_code >= 400:
                     raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
 
-                payload = response.json()
-                translations = payload["data"]["translations"]
-                return batch_index, [
-                    (unit_index, clean_translation(translated["translatedText"]))
-                    for (unit_index, _), translated in zip(batch, translations, strict=True)
-                ]
+                message = response.json()["choices"][0]["message"]
+                by_id = parse_translation_response(message["content"])
+                missing = [(unit_index, text) for unit_index, text in batch if unit_index not in by_id]
+                if missing:
+                    for unit_index, translated in translate_plain_batch(missing, api_key):
+                        by_id[unit_index] = translated
+                return batch_index, [(unit_index, by_id[unit_index]) for unit_index, _ in batch]
             except Exception as exc:
                 if attempt == 3:
                     raise RuntimeError(f"translation batch {batch_index} failed: {exc}") from exc
                 time.sleep(2 * attempt)
 
     raise RuntimeError(f"translation batch {batch_index} failed")
+
+
+def translate_single(unit_index: int, text: str, api_key: str) -> tuple[int, str]:
+    return translate_plain_batch([(unit_index, text)], api_key)[0]
+
+
+def translate_plain_batch(batch: list[tuple[int, str]], api_key: str) -> list[tuple[int, str]]:
+    results = []
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    with requests.Session() as session:
+        for unit_index, text in batch:
+            payload = {
+                "model": SILICONFLOW_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are translating academic PDF text from English into Simplified Chinese. "
+                            "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
+                            "Preserve terminology, proper nouns, citations, numbers, units, formulas, and inline variables. "
+                            "Return only the translated Chinese text. Do not add explanations, notes, markdown, or quotes."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": text,
+                    },
+                ],
+                "max_tokens": max(512, min(4096, len(text) * 2)),
+                "temperature": 0.1,
+                "top_p": 0.7,
+            }
+
+            for attempt in range(1, 4):
+                try:
+                    response = session.post(
+                        SILICONFLOW_CHAT_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=45,
+                    )
+                    if response.status_code >= 400:
+                        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+                    message = response.json()["choices"][0]["message"]
+                    results.append((unit_index, clean_translation(message["content"].strip())))
+                    break
+                except Exception as exc:
+                    if attempt == 3:
+                        raise RuntimeError(f"translation unit {unit_index} failed: {exc}") from exc
+                    time.sleep(2 * attempt)
+    return results
 
 
 def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None) -> list[str]:
@@ -681,12 +789,18 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
     workers = min(MAX_CONCURRENT_BATCHES, len(batches))
     completed_batches = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(translate_batch, batch_index, batch, api_key)
+        futures = {
+            executor.submit(translate_batch, batch_index, batch, api_key): batch_index
             for batch_index, batch in enumerate(batches, start=1)
-        ]
+        }
         for future in as_completed(futures):
-            batch_index, batch_results = future.result()
+            try:
+                batch_index, batch_results = future.result()
+            except Exception as exc:
+                batch_index = futures[future]
+                logger.write(f"  batch {batch_index}/{len(batches)} failed, retrying once: {exc}")
+                batch_results = [translate_single(unit_index, text, api_key) for unit_index, text in batches[batch_index - 1]]
+
             for unit_index, translated in batch_results:
                 unit = units[unit_index]
                 unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
@@ -806,34 +920,6 @@ def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock) -> float:
     return MIN_FONT_SIZE
 
 
-def render_text_image(rect: fitz.Rect, html_text: str, css: str, archive: fitz.Archive, scale_low: float) -> tuple[float, bytes]:
-    doc = fitz.open()
-    page = doc.new_page(width=rect.width, height=rect.height)
-    spare_height, _ = page.insert_htmlbox(
-        fitz.Rect(0, 0, rect.width, rect.height),
-        html_text,
-        css=css,
-        archive=archive,
-        scale_low=scale_low,
-    )
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(IMAGE_RENDER_SCALE, IMAGE_RENDER_SCALE), alpha=False)
-    image = pixmap.tobytes("png")
-    doc.close()
-    return spare_height, image
-
-
-def insert_text_layer(page: fitz.Page, rect: fitz.Rect, html_text: str, css: str, archive: fitz.Archive, scale_low: float) -> None:
-    page.insert_htmlbox(
-        rect,
-        html_text,
-        css=css,
-        archive=archive,
-        scale_low=scale_low,
-        overlay=True,
-        opacity=0,
-    )
-
-
 def write_translation(page: fitz.Page, block: TextBlock, translated: str, archive: fitz.Archive) -> int:
     rect = fitz.Rect(block.rect)
     cover = rect + (-0.8, -0.8, 0.8, 0.8)
@@ -845,18 +931,28 @@ def write_translation(page: fitz.Page, block: TextBlock, translated: str, archiv
     while font_size >= MIN_FONT_SIZE:
         layout_calls += 1
         css = textbox_css(font_size, block.align)
-        spare_height, image = render_text_image(rect, html_text, css, archive, scale_low=0.55)
+        spare_height, _ = page.insert_htmlbox(
+            rect,
+            html_text,
+            css=css,
+            archive=archive,
+            scale_low=0.55,
+            overlay=True,
+        )
         if spare_height >= 0:
-            page.insert_image(rect, stream=image, overlay=True)
-            insert_text_layer(page, rect, html_text, css, archive, scale_low=0.55)
             return layout_calls
         font_size -= 0.5
 
     layout_calls += 1
     css = textbox_css(MIN_FONT_SIZE, block.align)
-    _, image = render_text_image(rect, html_text, css, archive, scale_low=0.4)
-    page.insert_image(rect, stream=image, overlay=True)
-    insert_text_layer(page, rect, html_text, css, archive, scale_low=0.4)
+    page.insert_htmlbox(
+        rect,
+        html_text,
+        css=css,
+        archive=archive,
+        scale_low=0.4,
+        overlay=True,
+    )
     return layout_calls
 
 
@@ -960,9 +1056,9 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     logger = Logger(LOG_PATH)
     try:
-        api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+        api_key = os.getenv(TRANSLATE_API_KEY_ENV)
         if not api_key:
-            logger.write("ERROR: GOOGLE_TRANSLATE_API_KEY not found in .env")
+            logger.write(f"ERROR: {TRANSLATE_API_KEY_ENV} not found in .env")
             return 1
 
         args = parse_args(argv or [])

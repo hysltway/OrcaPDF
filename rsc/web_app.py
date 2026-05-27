@@ -23,6 +23,7 @@ from rsc.translate_pdf import (
     ROOT,
     SOURCE_DIR,
     TARGET_LANGUAGE,
+    TRANSLATE_API_KEY_ENV,
     translate_pdf,
 )
 
@@ -227,7 +228,7 @@ class JobProgressCallback:
 
 def worker_thread_func():
     load_dotenv(ROOT / ".env")
-    api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+    api_key = os.getenv(TRANSLATE_API_KEY_ENV)
 
     while True:
         try:
@@ -248,7 +249,7 @@ def worker_thread_func():
                 logger = Logger(job_log_path, progress_callback=cb)
                 try:
                     if not api_key:
-                        raise ValueError("GOOGLE_TRANSLATE_API_KEY not found in .env")
+                        raise ValueError(f"{TRANSLATE_API_KEY_ENV} not found in .env")
 
                     pdf_path = Path(job["original_path"])
                     translate_pdf(pdf_path, api_key, logger, progress_callback=cb)
