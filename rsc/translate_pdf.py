@@ -499,6 +499,8 @@ def is_figure_label(page: PageData, block: TextBlock) -> bool:
 def is_heading(block: TextBlock) -> bool:
     text = block.text.strip()
     words = re.findall(r"[A-Za-z][A-Za-z-]*", text)
+    if re.match(r"^\d+(?:\.\d+)*\s+\S", text) and 1 <= len(words) <= 12 and len(text) <= 120:
+        return True
     if not 1 <= len(words) <= 5:
         return False
     if any(char.isdigit() for char in text):
@@ -590,6 +592,12 @@ class Unit:
     text: str
 
 
+@dataclass(slots=True)
+class LayoutGroup:
+    blocks: list[TextBlock]
+    text: str
+
+
 def page_blocks(pages: list[PageData]) -> list[tuple[PageData, TextBlock]]:
     return [(page, block) for page in pages for block in page.blocks]
 
@@ -659,6 +667,102 @@ def translation_units(blocks: list[tuple[PageData, TextBlock]], references_start
     return units
 
 
+def is_layout_body_block(page: PageData, block: TextBlock, references_start: tuple[int, float, int, float] | None) -> bool:
+    rect = fitz.Rect(block.rect)
+    return (
+        is_body_block(page, block, references_start)
+        and not is_caption(block.text)
+        and not is_heading(block)
+        and block.align == "left"
+        and not block.bold
+        and not block.italic
+        and not block.leading_bold
+        and rect.width >= 170
+        and 6 <= block.font_size <= 12
+    )
+
+
+def can_merge_layout_block(page: PageData, prev: TextBlock, block: TextBlock) -> bool:
+    prev_rect = fitz.Rect(prev.rect)
+    rect = fitz.Rect(block.rect)
+    gap = rect.y0 - prev_rect.y1
+    same_column = (prev_rect.x0 < page.width / 2) == (rect.x0 < page.width / 2)
+    return (
+        -2 <= gap <= max(28, prev.font_size * 3.0)
+        and rect.y0 >= prev_rect.y0 - 2
+        and abs(prev_rect.x0 - rect.x0) <= 24
+        and abs(prev_rect.width - rect.width) <= 36
+        and abs(prev.font_size - block.font_size) <= 1.5
+        and same_column
+    )
+
+
+def layout_separator(prev: TextBlock) -> str:
+    return "" if paragraph_continues(prev.text) else "\n\n"
+
+
+def layout_group_text(items: list[tuple[int, TextBlock, str]]) -> str:
+    parts = [items[0][2]]
+    for offset, (_, block, translated) in enumerate(items[1:], start=1):
+        parts.append(layout_separator(items[offset - 1][1]))
+        parts.append(translated)
+    return "".join(parts)
+
+
+def layout_groups(
+    page: PageData,
+    translations: list[tuple[int, TextBlock, str]],
+    references_start: tuple[int, float, int, float] | None,
+) -> list[LayoutGroup]:
+    groups = []
+    current: list[tuple[int, TextBlock, str]] = []
+    headings = [
+        fitz.Rect(block.rect)
+        for block in page.blocks
+        if is_heading(block)
+    ]
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            groups.append(LayoutGroup([block for _, block, _ in current], layout_group_text(current)))
+            current = []
+
+    def crosses_heading(prev: TextBlock, block: TextBlock) -> bool:
+        prev_rect = fitz.Rect(prev.rect)
+        rect = fitz.Rect(block.rect)
+        if abs(prev_rect.x0 - rect.x0) > 24:
+            return False
+        top = min(prev_rect.y1, rect.y1)
+        bottom = max(prev_rect.y0, rect.y0)
+        for heading in headings:
+            overlaps_column = min(prev_rect.x1, rect.x1, heading.x1) - max(prev_rect.x0, rect.x0, heading.x0) > 20
+            if overlaps_column and top < heading.y0 < bottom:
+                return True
+        return False
+
+    for item in translations:
+        block_index, block, _ = item
+        if not is_layout_body_block(page, block, references_start):
+            flush_current()
+            groups.append(LayoutGroup([block], item[2]))
+            continue
+
+        if (
+            current
+            and block_index == current[-1][0] + 1
+            and can_merge_layout_block(page, current[-1][1], block)
+            and not crosses_heading(current[-1][1], block)
+        ):
+            current.append(item)
+        else:
+            flush_current()
+            current = [item]
+
+    flush_current()
+    return groups
+
+
 def split_translation(text: str, blocks: list[TextBlock], line_height: float) -> list[str]:
     if len(blocks) == 1:
         return [text]
@@ -676,15 +780,42 @@ def split_translation(text: str, blocks: list[TextBlock], line_height: float) ->
     for capacity in capacities[:-1]:
         used_capacity += capacity
         target = round(len(text) * used_capacity / total)
-        split_at = text.rfind("。", start, target + 20)
-        if split_at == -1 or split_at <= start:
-            split_at = text.rfind("，", start, target + 15)
-        if split_at == -1 or split_at <= start:
-            split_at = target
-        parts.append(text[start:split_at + 1].strip())
-        start = split_at + 1
+        split_at = split_position(text, start, target)
+        parts.append(text[start:split_at].strip())
+        start = split_at
+        while start < len(text) and text[start].isspace():
+            start += 1
     parts.append(text[start:].strip())
     return parts
+
+
+def is_ascii_word_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char in "-_")
+
+
+def split_position(text: str, start: int, target: int) -> int:
+    if target <= start:
+        return min(len(text), start + 1)
+    if target >= len(text):
+        return len(text)
+
+    left = max(start + 1, target - 80)
+    right = min(len(text), target + 80)
+    for marks in ("。！？；", "，、", " "):
+        candidates = [text.rfind(mark, left, right) for mark in marks]
+        split_at = max(candidates)
+        if split_at >= left:
+            return split_at if text[split_at].isspace() else split_at + 1
+
+    split_at = min(max(target, start + 1), len(text) - 1)
+    while (
+        split_at > start + 1
+        and split_at < len(text)
+        and is_ascii_word_char(text[split_at - 1])
+        and is_ascii_word_char(text[split_at])
+    ):
+        split_at -= 1
+    return split_at
 
 
 def translation_prompt(batch: list[tuple[int, str]]) -> str:
@@ -915,16 +1046,26 @@ def html_fragments(text: str) -> str:
     current = []
     current_class = None
 
-    for char in text:
-        char_class = "cjk" if is_cjk(char) else "latin"
-        if current and char_class != current_class:
+    def flush_current() -> None:
+        nonlocal current, current_class
+        if current:
             parts.append(f'<span class="{current_class}">{html.escape("".join(current))}</span>')
             current = []
+
+    for char in text:
+        if char == "\n":
+            flush_current()
+            parts.append("<br>")
+            current_class = None
+            continue
+
+        char_class = "cjk" if is_cjk(char) else "latin"
+        if current and char_class != current_class:
+            flush_current()
         current.append(char)
         current_class = char_class
 
-    if current:
-        parts.append(f'<span class="{current_class}">{html.escape("".join(current))}</span>')
+    flush_current()
     return "".join(parts)
 
 
@@ -1004,7 +1145,11 @@ def styled_html(text: str, block: TextBlock) -> str:
 
 def clean_translation(text: str) -> str:
     text = re.sub(r"</?(?:sub|sup)>", "", text)
-    return html.unescape(text)
+    text = html.unescape(text)
+    text = re.sub(r"\s*\n\s*\n\s*", "\n\n", text)
+    text = re.sub(r"(?<!\n)\s*\n\s*(?!\n)", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
 @cache
@@ -1067,7 +1212,13 @@ def text_align_value(align: str) -> int:
 
 
 def can_use_fast_textbox(block: TextBlock, translated: str) -> bool:
-    return not (block.italic or block.leading_bold or "**" in translated)
+    return not (
+        block.bold
+        or block.italic
+        or block.leading_bold
+        or "**" in translated
+        or any(char in translated for char in "，。！？；：、）】》”’")
+    )
 
 
 def write_fast_translation(
@@ -1124,6 +1275,38 @@ def write_translation(
     return "html"
 
 
+def union_rect(blocks: list[TextBlock]) -> fitz.Rect:
+    rect = fitz.Rect(blocks[0].rect)
+    for block in blocks[1:]:
+        rect.include_rect(fitz.Rect(block.rect))
+    return rect
+
+
+def group_block(group: LayoutGroup) -> TextBlock:
+    first = group.blocks[0]
+    rect = union_rect(group.blocks)
+    return TextBlock(
+        rect=tuple(rect),
+        text=first.text,
+        font_size=first.font_size,
+        line_count=sum(block.line_count for block in group.blocks),
+        bold=first.bold,
+        italic=first.italic,
+        leading_bold=first.leading_bold,
+        align=first.align,
+    )
+
+
+def write_layout_group(
+    page: fitz.Page,
+    group: LayoutGroup,
+    archive: fitz.Archive,
+    regular_body_size: float | None,
+    line_height: float,
+) -> str:
+    return write_translation(page, group_block(group), group.text, archive, regular_body_size, line_height)
+
+
 def build_pdf(
     source_doc: fitz.Document,
     pages: list[PageData],
@@ -1142,7 +1325,8 @@ def build_pdf(
     html_layout_calls = 0
     render_start = time.perf_counter()
     archive = fitz.Archive(FONT_DIR)
-    regular_body_size = body_font_size(pages, find_references_range(pages))
+    references_start = find_references_range(pages)
+    regular_body_size = body_font_size(pages, references_start)
 
     if logger:
         logger.write(f"  typesetting PDF: checking {total_blocks} extracted text blocks...")
@@ -1153,21 +1337,21 @@ def build_pdf(
     for page_data in pages:
         target_page = output[page_data.index]
         page_translations = []
-        for block in page_data.blocks:
+        for block_index, block in enumerate(page_data.blocks):
             translated = translations[translation_index]
             translation_index += 1
             if translated == block.text:
                 continue
-            page_translations.append((block, translated))
+            page_translations.append((block_index, block, translated))
 
-        covered_blocks += cover_original_text(target_page, [block for block, _ in page_translations])
-        for block, translated in page_translations:
-            layout_mode = write_translation(target_page, block, translated, archive, regular_body_size, line_height)
+        covered_blocks += cover_original_text(target_page, [block for _, block, _ in page_translations])
+        for group in layout_groups(page_data, page_translations, references_start):
+            layout_mode = write_layout_group(target_page, group, archive, regular_body_size, line_height)
             if layout_mode == "fast":
                 fast_layout_calls += 1
             else:
                 html_layout_calls += 1
-            processed_blocks += 1
+            processed_blocks += len(group.blocks)
             if logger and processed_blocks % 10 == 0:
                 logger.write(f"    typesetting: rendered {processed_blocks} changed blocks...")
 
