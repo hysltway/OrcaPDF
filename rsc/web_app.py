@@ -288,7 +288,14 @@ class JobProgressCallback:
 
 def worker_thread_func():
     load_dotenv(ROOT / ".env")
-    api_key = os.getenv(TRANSLATE_API_KEY_ENV)
+    provider = os.getenv("TRANSLATE_PROVIDER", "siliconflow").lower()
+    if provider == "google":
+        api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+        key_name = "GOOGLE_TRANSLATE_API_KEY"
+    else:
+        api_key = os.getenv("siliconflow_TRANSLATE_API_KEY")
+        key_name = "siliconflow_TRANSLATE_API_KEY"
+
     try:
         line_height = parse_line_height(os.getenv(TYPESETTING_LINE_HEIGHT_ENV, str(DEFAULT_TEXT_LINE_HEIGHT)))
     except ValueError as exc:
@@ -316,7 +323,7 @@ def worker_thread_func():
                 logger = Logger(job_log_path, progress_callback=cb)
                 try:
                     if not api_key:
-                        raise ValueError(f"{TRANSLATE_API_KEY_ENV} not found in .env")
+                        raise ValueError(f"{key_name} not found in .env for provider '{provider}'")
                     if line_height_error:
                         raise ValueError(line_height_error)
 

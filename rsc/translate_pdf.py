@@ -847,10 +847,10 @@ def thread_session() -> requests.Session:
     return session
 
 
-def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
+def translate_batch_siliconflow(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
     if len(batch) == 1:
         unit_index, text = batch[0]
-        return batch_index, [(unit_index, translate_unit_text(unit_index, text, api_key))]
+        return batch_index, [(unit_index, translate_unit_text_siliconflow(unit_index, text, api_key))]
 
     total_chars = sum(len(text) for _, text in batch)
     payload = {
@@ -912,7 +912,7 @@ def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str
     raise RuntimeError(f"translation batch {batch_index} failed")
 
 
-def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
+def translate_unit_text_siliconflow(unit_index: int, text: str, api_key: str) -> str:
     payload = {
         "model": SILICONFLOW_MODEL,
         "messages": [
@@ -960,6 +960,92 @@ def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
                 time.sleep(RETRY_SLEEP_SECONDS)
 
     raise RuntimeError(f"translation unit {unit_index} failed")
+
+
+def translate_batch_google(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
+    url = f"https://translation.googleapis.com/language/translate/v2?key={api_key}"
+    payload = {
+        "q": [text for _, text in batch],
+        "target": TARGET_LANGUAGE,
+        "format": "text"
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+    session = thread_session()
+    with _llm_request_semaphore:
+        for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+            try:
+                response = session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=TRANSLATION_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+                translations = response.json()["data"]["translations"]
+                batch_results = [
+                    (unit_index, clean_translation(item["translatedText"]))
+                    for (unit_index, _), item in zip(batch, translations)
+                ]
+                return batch_index, batch_results
+            except Exception as exc:
+                if attempt == TRANSLATION_ATTEMPTS:
+                    raise RuntimeError(f"Google translation batch {batch_index} failed: {exc}") from exc
+                time.sleep(RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Google translation batch {batch_index} failed")
+
+
+def translate_unit_text_google(unit_index: int, text: str, api_key: str) -> str:
+    url = f"https://translation.googleapis.com/language/translate/v2?key={api_key}"
+    payload = {
+        "q": [text],
+        "target": TARGET_LANGUAGE,
+        "format": "text"
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+    session = thread_session()
+    with _llm_request_semaphore:
+        for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+            try:
+                response = session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=TRANSLATION_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+                translated_text = response.json()["data"]["translations"][0]["translatedText"]
+                return clean_translation(translated_text)
+            except Exception as exc:
+                if attempt == TRANSLATION_ATTEMPTS:
+                    raise RuntimeError(f"Google translation unit {unit_index} failed: {exc}") from exc
+                time.sleep(RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Google translation unit {unit_index} failed")
+
+
+def translate_batch(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
+    provider = os.getenv("TRANSLATE_PROVIDER", "siliconflow").lower()
+    if provider == "google":
+        return translate_batch_google(batch_index, batch, api_key)
+    else:
+        return translate_batch_siliconflow(batch_index, batch, api_key)
+
+
+def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
+    provider = os.getenv("TRANSLATE_PROVIDER", "siliconflow").lower()
+    if provider == "google":
+        return translate_unit_text_google(unit_index, text, api_key)
+    else:
+        return translate_unit_text_siliconflow(unit_index, text, api_key)
 
 
 def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None, line_height: float = DEFAULT_TEXT_LINE_HEIGHT) -> list[str]:
@@ -1467,10 +1553,19 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     logger = Logger(LOG_PATH)
     try:
-        api_key = os.getenv(TRANSLATE_API_KEY_ENV)
+        provider = os.getenv("TRANSLATE_PROVIDER", "siliconflow").lower()
+        if provider == "google":
+            api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+            key_name = "GOOGLE_TRANSLATE_API_KEY"
+        else:
+            api_key = os.getenv("siliconflow_TRANSLATE_API_KEY")
+            key_name = "siliconflow_TRANSLATE_API_KEY"
+
         if not api_key:
-            logger.write(f"ERROR: {TRANSLATE_API_KEY_ENV} not found in .env")
+            logger.write(f"ERROR: {key_name} not found in .env for provider '{provider}'")
             return 1
+
+        logger.write(f"Translation provider: {provider}")
 
         args = parse_args(argv or [])
         pdfs = collect_pdfs(args.paths)
