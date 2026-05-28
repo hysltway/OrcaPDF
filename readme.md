@@ -48,11 +48,23 @@ auto_PDF_translate/
 
 ### 1. 环境准备
 
-确保您的系统中已安装 Python 3.12 或兼容版本，以及 Node.js 环境（用于前端开发）。
+本项目后端 PDF 解析与处理构建在 **[OpenDataLoader PDF](https://github.com/opendataloader-project/opendataloader-pdf)** 生态之上。运行前需满足以下环境依赖要求：
 
-#### 安装后端依赖
+#### ⚙️ 系统先决条件
+*   **Java 运行环境 (JRE/JDK 11+)**：由于底层解析引擎依赖 Java 虚拟机运行，系统必须安装 **Java 11 或更高版本**。
+    *   *验证方法*：在终端运行 `java -version`。如果找不到命令，请前往 [Adoptium (Eclipse Temurin)](https://adoptium.net/) 安装 JDK 11 或以上版本并配置环境变量。
+*   **Python 版本**：Python 3.10+（推荐 Python 3.12）。
+*   **Node.js 版本**：用于前端对照阅读开发环境（可选，双栏同步阅读界面已打包内置在后端服务中，无二次开发需求可不安装）。
+
+#### 📦 安装依赖库
+在项目根目录下打开终端，依次安装本项目依赖及 OpenDataLoader 核心依赖包：
+
 ```powershell
+# 1. 安装项目基础依赖
 pip install -r requirements.txt
+
+# 2. 安装并升级 OpenDataLoader PDF 核心解析 SDK
+pip install -U opendataloader-pdf
 ```
 
 #### 配置与接口切换 (.env)
