@@ -74,8 +74,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ### 5. Project Structure
 
-- `rsc/` contains Python source code. The main PDF translation workflow lives in `rsc/translate_pdf.py`, and the FastAPI web server for local workbench API lives in `rsc/web_app.py`.
-- `my-react-app/` contains the React-based frontend web workbench for file upload, translation job queues, event-driven log monitoring, and synchronized dual-column PDF preview.
+- `rsc/` contains Python source code. The main PDF translation workflow lives in `rsc/translate_pdf.py`, while `rsc/web_app.py` provides the FastAPI backend, task queue, and Uvicorn runtime.
+- `my-react-app/` contains the React-based frontend workbench (built with Vite, TypeScript, and react-pdf) for file uploading, progress tracking, and side-by-side PDF preview.
 - `original_PDF/` contains source PDFs waiting to be translated. Keep the directory with `.gitkeep` when it has no committed inputs.
 - `processed_PDF/` contains generated translated PDFs. Treat these as output artifacts unless the task explicitly asks to keep or review a generated sample.
 - `docs/` contains local reference material for OpenDataLoader PDF and Cloud Translation API. Consult it before changing translation behavior or API usage.

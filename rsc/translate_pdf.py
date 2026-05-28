@@ -45,6 +45,7 @@ FONT_FACE_CSS = f"""
 """
 MIN_FONT_SIZE = 4.5  # 翻译回写 PDF 时的最小字号限制（防止文字缩得过小无法阅读）
 DEFAULT_TEXT_LINE_HEIGHT = 1.2  # 排版时默认的文本行高
+FAST_CJK_FONT_NAME = "CjkRegularFast"
 MAX_CONCURRENT_BATCHES = 128  # 允许并发提交到大模型翻译的批次（Batch）上限
 MAX_BATCH_ITEMS = 1  # 每个翻译批次中包含的文本单元（Unit）数量最大值
 MAX_BATCH_CHARS = 12000  # 每个翻译批次所允许的最大字符长度限制
@@ -1050,10 +1051,51 @@ def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_bod
 
 
 def cover_original_text(page: fitz.Page, blocks: list[TextBlock]) -> int:
+    if not blocks:
+        return 0
+    shape = page.new_shape()
     for block in blocks:
         rect = fitz.Rect(block.rect) + (-0.8, -0.8, 0.8, 0.8)
-        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+        shape.draw_rect(rect)
+    shape.finish(width=0, color=(1, 1, 1), fill=(1, 1, 1))
+    shape.commit(overlay=True)
     return len(blocks)
+
+
+def text_align_value(align: str) -> int:
+    return fitz.TEXT_ALIGN_CENTER if align == "center" else fitz.TEXT_ALIGN_LEFT
+
+
+def can_use_fast_textbox(block: TextBlock, translated: str) -> bool:
+    return not (block.italic or block.leading_bold or "**" in translated)
+
+
+def write_fast_translation(
+    page: fitz.Page,
+    block: TextBlock,
+    translated: str,
+    font_size: float,
+    line_height: float,
+) -> bool:
+    rect = fitz.Rect(block.rect)
+    align = text_align_value(block.align)
+    size = font_size
+    while size >= MIN_FONT_SIZE:
+        shape = page.new_shape()
+        spare_height = shape.insert_textbox(
+            rect,
+            translated,
+            fontfile=CJK_REGULAR_FONT,
+            fontname=FAST_CJK_FONT_NAME,
+            fontsize=size,
+            lineheight=line_height,
+            align=align,
+        )
+        if spare_height >= 0:
+            shape.commit(overlay=True)
+            return True
+        size -= 0.5
+    return False
 
 
 def write_translation(
@@ -1063,10 +1105,13 @@ def write_translation(
     archive: fitz.Archive,
     regular_body_size: float | None,
     line_height: float,
-) -> int:
+) -> str:
     rect = fitz.Rect(block.rect)
-    html_text = styled_html(translated, block)
     font_size = estimate_font_size(rect, translated, block, regular_body_size, line_height)
+    if can_use_fast_textbox(block, translated) and write_fast_translation(page, block, translated, font_size, line_height):
+        return "fast"
+
+    html_text = styled_html(translated, block)
     css = textbox_css(font_size, block.align, line_height)
     page.insert_htmlbox(
         rect,
@@ -1076,7 +1121,7 @@ def write_translation(
         scale_low=0.4,
         overlay=True,
     )
-    return 1
+    return "html"
 
 
 def build_pdf(
@@ -1093,7 +1138,8 @@ def build_pdf(
     total_blocks = sum(len(page_data.blocks) for page_data in pages)
     processed_blocks = 0
     covered_blocks = 0
-    layout_calls = 0
+    fast_layout_calls = 0
+    html_layout_calls = 0
     render_start = time.perf_counter()
     archive = fitz.Archive(FONT_DIR)
     regular_body_size = body_font_size(pages, find_references_range(pages))
@@ -1116,7 +1162,11 @@ def build_pdf(
 
         covered_blocks += cover_original_text(target_page, [block for block, _ in page_translations])
         for block, translated in page_translations:
-            layout_calls += write_translation(target_page, block, translated, archive, regular_body_size, line_height)
+            layout_mode = write_translation(target_page, block, translated, archive, regular_body_size, line_height)
+            if layout_mode == "fast":
+                fast_layout_calls += 1
+            else:
+                html_layout_calls += 1
             processed_blocks += 1
             if logger and processed_blocks % 10 == 0:
                 logger.write(f"    typesetting: rendered {processed_blocks} changed blocks...")
@@ -1126,7 +1176,7 @@ def build_pdf(
         logger.write(
             f"  typesetting: {total_blocks} extracted blocks checked; {covered_blocks} changed source blocks covered and "
             f"{processed_blocks} translated blocks rendered in "
-            f"{render_seconds:.1f}s ({layout_calls} html layout calls)"
+            f"{render_seconds:.1f}s ({fast_layout_calls} fast textbox calls, {html_layout_calls} html layout calls)"
         )
         logger.write("  typesetting: saving finalized PDF output...")
 
@@ -1135,7 +1185,15 @@ def build_pdf(
     if tmp_path.exists():
         tmp_path.unlink()
     save_start = time.perf_counter()
-    output.save(tmp_path, garbage=0, deflate=False)
+    output.save(
+        tmp_path,
+        garbage=4,
+        deflate=True,
+        deflate_images=True,
+        deflate_fonts=True,
+        use_objstms=1,
+        compression_effort=6,
+    )
     output.close()
     tmp_path.replace(output_path)
     if logger:
