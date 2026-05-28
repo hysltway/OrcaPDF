@@ -29,7 +29,7 @@ TRANSLATE_API_KEY_ENV = "siliconflow_TRANSLATE_API_KEY"
 TYPESETTING_LINE_HEIGHT_ENV = "PDF_TRANSLATE_LINE_HEIGHT"
 TARGET_LANGUAGE = "zh-CN"
 CJK_REGULAR_FONT = "C:/Windows/Fonts/STSONG.TTF"
-CJK_BOLD_FONT = CJK_REGULAR_FONT
+CJK_BOLD_FONT = "C:/Windows/Fonts/simhei.ttf" if Path("C:/Windows/Fonts/simhei.ttf").exists() else CJK_REGULAR_FONT
 TIMES_FONT = "C:/Windows/Fonts/times.ttf"
 TIMES_BOLD_FONT = "C:/Windows/Fonts/timesbd.ttf"
 TIMES_ITALIC_FONT = "C:/Windows/Fonts/timesi.ttf"
@@ -46,6 +46,7 @@ FONT_FACE_CSS = f"""
 MIN_FONT_SIZE = 4.5  # 翻译回写 PDF 时的最小字号限制（防止文字缩得过小无法阅读）
 DEFAULT_TEXT_LINE_HEIGHT = 1.2  # 排版时默认的文本行高
 FAST_CJK_FONT_NAME = "CjkRegularFast"
+FAST_CJK_BOLD_FONT_NAME = "CjkBoldFast"
 MAX_CONCURRENT_BATCHES = 128  # 允许并发提交到大模型翻译的批次（Batch）上限
 MAX_BATCH_ITEMS = 1  # 每个翻译批次中包含的文本单元（Unit）数量最大值
 MAX_BATCH_CHARS = 12000  # 每个翻译批次所允许的最大字符长度限制
@@ -481,6 +482,20 @@ def is_first_page_metadata(page: PageData, block: TextBlock) -> bool:
     return block.rect[1] < 220
 
 
+def is_version_footer(page: PageData, block: TextBlock) -> bool:
+    rect = fitz.Rect(block.rect)
+    if rect.y0 < page.height - 65:
+        return False
+    text = block.text.strip()
+    if re.fullmatch(r"\d+", text):
+        return False
+    return re.search(
+        r"\b(?:conference|proceedings|workshop|preprint|under review|neurips|iclr|icml|cvpr|eccv|acl|arxiv)\b",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
 def is_caption(text: str) -> bool:
     return re.search(r"\b(figure|fig\.|table)\s*\d+[:.]", text.strip(), re.IGNORECASE) is not None
 
@@ -491,6 +506,8 @@ def is_figure_label(page: PageData, block: TextBlock) -> bool:
     words = re.findall(r"[A-Za-z][A-Za-z-]+", text)
     if re.match(r"^GT\s+\([a-z]\)", text):
         return True
+    if page.index > 0 and rect.y1 < 180 and block.font_size <= 8.5 and len(words) <= 8:
+        return True
     if bool(re.search(r"\([a-z]\)", text)) and rect.y1 < 540 and word_count(text) <= 20:
         return True
     return len(page.blocks) > 40 and rect.y1 < 430 and rect.width < 220 and len(words) <= 12
@@ -499,8 +516,14 @@ def is_figure_label(page: PageData, block: TextBlock) -> bool:
 def is_heading(block: TextBlock) -> bool:
     text = block.text.strip()
     words = re.findall(r"[A-Za-z][A-Za-z-]*", text)
-    if re.match(r"^\d+(?:\.\d+)*\s+\S", text) and 1 <= len(words) <= 12 and len(text) <= 120:
-        return True
+    numbered = re.match(r"^\d+(?:\.\d+)*\s+(.+)", text)
+    if numbered and 1 <= len(words) <= 12 and len(text) <= 120:
+        first_word = words[0] if words else ""
+        return bool(first_word[:1].isupper())
+    if block.font_size < 9:
+        return False
+    if not block.bold and block.font_size < 11:
+        return False
     if not 1 <= len(words) <= 5:
         return False
     if any(char.isdigit() for char in text):
@@ -512,6 +535,8 @@ def is_heading(block: TextBlock) -> bool:
 
 def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int, float, int, float] | None) -> bool:
     rect = fitz.Rect(block.rect)
+    if is_version_footer(page, block):
+        return False
     if is_reference_block(page, block, references_start):
         return False
     if is_side_note(page, block):
@@ -529,7 +554,7 @@ def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int,
     if page.index == 0 and rect.y0 < 130 and rect.width > 250:
         return should_translate(block.text)
     if is_heading(block):
-        return rect.width >= 55
+        return rect.width >= 25
     if rect.width < 170:
         return False
     return should_translate(block.text)
@@ -596,6 +621,7 @@ class Unit:
 class LayoutGroup:
     blocks: list[TextBlock]
     text: str
+    hidden: bool = False
 
 
 def page_blocks(pages: list[PageData]) -> list[tuple[PageData, TextBlock]]:
@@ -697,16 +723,22 @@ def can_merge_layout_block(page: PageData, prev: TextBlock, block: TextBlock) ->
     )
 
 
-def layout_separator(prev: TextBlock) -> str:
-    return "" if paragraph_continues(prev.text) else "\n\n"
+def rendered_translation_text(items: list[tuple[int, TextBlock, str]]) -> str:
+    paragraphs: list[str] = []
+    current: list[str] = []
 
+    for offset, (_, block, translated) in enumerate(items):
+        if offset and not paragraph_continues(items[offset - 1][1].text):
+            paragraph = "".join(current).strip()
+            if paragraph:
+                paragraphs.append(paragraph)
+            current = []
+        current.append(translated)
 
-def layout_group_text(items: list[tuple[int, TextBlock, str]]) -> str:
-    parts = [items[0][2]]
-    for offset, (_, block, translated) in enumerate(items[1:], start=1):
-        parts.append(layout_separator(items[offset - 1][1]))
-        parts.append(translated)
-    return "".join(parts)
+    paragraph = "".join(current).strip()
+    if paragraph:
+        paragraphs.append(paragraph)
+    return "\n\n".join(paragraphs)
 
 
 def layout_groups(
@@ -725,7 +757,7 @@ def layout_groups(
     def flush_current() -> None:
         nonlocal current
         if current:
-            groups.append(LayoutGroup([block for _, block, _ in current], layout_group_text(current)))
+            groups.append(LayoutGroup([block for _, block, _ in current], rendered_translation_text(current)))
             current = []
 
     def crosses_heading(prev: TextBlock, block: TextBlock) -> bool:
@@ -743,8 +775,15 @@ def layout_groups(
 
     for item in translations:
         block_index, block, _ = item
+        if is_version_footer(page, block):
+            flush_current()
+            groups.append(LayoutGroup([block], "", hidden=True))
+            continue
         if not is_layout_body_block(page, block, references_start):
             flush_current()
+            if not item[2]:
+                groups.append(LayoutGroup([block], "", hidden=True))
+                continue
             groups.append(LayoutGroup([block], item[2]))
             continue
 
@@ -825,6 +864,122 @@ def translation_prompt(batch: list[tuple[int, str]]) -> str:
     )
 
 
+COMMON_HEADING_TRANSLATIONS = {
+    "abstract": "摘要",
+    "introduction": "引言",
+    "related work": "相关工作",
+    "method": "方法",
+    "methods": "方法",
+    "experiments": "实验",
+    "results": "结果",
+    "discussion": "讨论",
+    "conclusion": "结论",
+    "conclusions": "结论",
+    "limitations": "局限性",
+    "references": "参考文献",
+    "acknowledgments": "致谢",
+    "acknowledgements": "致谢",
+}
+
+
+def fixed_heading_translation(text: str) -> str | None:
+    stripped = re.sub(r"\s+", " ", text.strip())
+    numbered = re.match(r"^(\d+(?:\.\d+)*)\s+(.+)$", stripped)
+    if numbered:
+        prefix, heading = numbered.groups()
+        translated = COMMON_HEADING_TRANSLATIONS.get(heading.lower())
+        if translated:
+            return f"{prefix} {translated}"
+        return None
+    return COMMON_HEADING_TRANSLATIONS.get(stripped.lower())
+
+
+def sanitize_translation(blocks: list[TextBlock], translated: str) -> str:
+    if len(blocks) != 1:
+        return translated
+
+    block = blocks[0]
+    if not is_heading(block):
+        return translated
+
+    fixed = fixed_heading_translation(block.text)
+    if fixed:
+        return fixed
+
+    stripped = translated.strip()
+    if len(stripped) > max(28, len(block.text) * 3) or "\n" in stripped:
+        return block.text
+    if stripped.count("。") + stripped.count(".") > 1:
+        return block.text
+    return stripped
+
+
+INLINE_HEADING_TRANSLATIONS = {
+    "introduction": "引言",
+    "related work": "相关工作",
+    "method": "方法",
+    "methods": "方法",
+    "experiments": "实验",
+    "results": "结果",
+    "discussion": "讨论",
+    "conclusion": "结论",
+    "conclusions": "结论",
+}
+
+
+def split_leading_heading(blocks: list[TextBlock], translated: str) -> str:
+    if len(blocks) != 1:
+        return translated
+    block = blocks[0]
+    if not block.leading_bold:
+        return translated
+
+    source = re.sub(r"\s+", " ", block.text.strip())
+    for heading, zh_heading in INLINE_HEADING_TRANSLATIONS.items():
+        if not source.lower().startswith(heading + " "):
+            continue
+        if translated.startswith(zh_heading) and not translated.startswith(zh_heading + "\n\n"):
+            rest = translated[len(zh_heading):].lstrip(" ：:")
+            if rest:
+                return f"{zh_heading}\n\n{rest}"
+        break
+    return translated
+
+
+def source_terms(text: str) -> set[str]:
+    terms = set()
+    for term in re.findall(r"\b[A-Z][A-Z0-9-]{1,}\b", text):
+        if term not in {"PDF", "JSON"}:
+            terms.add(term)
+    for term in re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}\b", text):
+        if term.lower() not in COMMON_HEADING_TRANSLATIONS:
+            terms.add(term)
+    return terms
+
+
+def translation_preserves_terms(source: str, translated: str) -> bool:
+    terms = source_terms(source)
+    if not terms:
+        return True
+    required = [term for term in terms if len(term) <= 20]
+    if not required:
+        return True
+    present = sum(1 for term in required if term in translated)
+    return present >= max(1, len(required) // 3)
+
+
+def translation_is_suspicious(source: str, translated: str) -> bool:
+    if not translation_preserves_terms(source, translated):
+        return True
+    source_lower = source.lower()
+    if ("eeg" in source_lower or "brain" in source_lower or "neural" in source_lower) and re.search(
+        r"材料|冲击|载荷|应力|变形|破坏模式|工程设计",
+        translated,
+    ):
+        return True
+    return False
+
+
 def parse_translation_response(text: str) -> dict[int, str]:
     text = text.strip()
     if text.startswith("```"):
@@ -863,6 +1018,10 @@ def translate_batch_siliconflow(batch_index: int, batch: list[tuple[int, str]], 
                     "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
                     "Preserve terminology consistency, proper nouns, model names, dataset names, citations, numbers, "
                     "units, formulas, inline variables, punctuation that belongs to equations, and bracketed references. "
+                    "Do not insert manual line breaks. Keep each original paragraph as one paragraph; only use a blank line "
+                    "between paragraphs when the source text clearly contains separate paragraphs. "
+                    "Do not convert inline enumerations into lists and do not add blank lines. "
+                    "Do not add spaces between Chinese characters. "
                     "Return only valid JSON in this exact shape: "
                     "{\"translations\":[{\"id\":number,\"text\":\"translated Chinese\"}]}. "
                     "Return every input id exactly once. Do not translate JSON keys or ids."
@@ -922,6 +1081,10 @@ def translate_unit_text_siliconflow(unit_index: int, text: str, api_key: str) ->
                     "You are translating academic PDF text from English into Simplified Chinese. "
                     "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
                     "Preserve terminology, proper nouns, citations, numbers, units, formulas, and inline variables. "
+                    "Do not insert manual line breaks. Keep the original text as one paragraph unless the source clearly "
+                    "contains separate paragraphs; in that case separate paragraphs with exactly one blank line. "
+                    "Do not convert inline enumerations into lists and do not add blank lines. "
+                    "Do not add spaces between Chinese characters. "
                     "Return only the translated Chinese text. Do not add explanations, notes, markdown, or quotes."
                 ),
             },
@@ -1048,6 +1211,16 @@ def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
         return translate_unit_text_siliconflow(unit_index, text, api_key)
 
 
+def retry_suspicious_translation(unit_index: int, source: str, translated: str, api_key: str) -> str:
+    if not translation_is_suspicious(source, translated):
+        return translated
+
+    retry = translate_unit_text(unit_index, source, api_key)
+    if translation_is_suspicious(source, retry):
+        return translated
+    return retry
+
+
 def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progress_callback=None, line_height: float = DEFAULT_TEXT_LINE_HEIGHT) -> list[str]:
     blocks = page_blocks(pages)
     texts = [block.text for _, block in blocks]
@@ -1105,6 +1278,9 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
             for unit_index, translated in batch_results:
                 unit = units[unit_index]
                 unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
+                translated = retry_suspicious_translation(unit_index, unit.text, translated, api_key)
+                translated = sanitize_translation(unit_blocks, translated)
+                translated = split_leading_heading(unit_blocks, translated)
                 parts = split_translation(translated, unit_blocks, line_height)
                 for text_index, part in zip(unit.indexes, parts, strict=True):
                     results[text_index] = part
@@ -1232,9 +1408,13 @@ def styled_html(text: str, block: TextBlock) -> str:
 def clean_translation(text: str) -> str:
     text = re.sub(r"</?(?:sub|sup)>", "", text)
     text = html.unescape(text)
-    text = re.sub(r"\s*\n\s*\n\s*", "\n\n", text)
-    text = re.sub(r"(?<!\n)\s*\n\s*(?!\n)", " ", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]*\n+[ \t]*", " ", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
+    text = re.sub(r"(?<=[，。！？；：、（《【“‘])\s+", "", text)
+    text = re.sub(r"\s+(?=[，。！？；：、）】》”’])", "", text)
     return text.strip()
 
 
@@ -1299,8 +1479,7 @@ def text_align_value(align: str) -> int:
 
 def can_use_fast_textbox(block: TextBlock, translated: str) -> bool:
     return not (
-        block.bold
-        or block.italic
+        block.italic
         or block.leading_bold
         or "**" in translated
         or any(char in translated for char in "，。！？；：、）】》”’")
@@ -1317,13 +1496,15 @@ def write_fast_translation(
     rect = fitz.Rect(block.rect)
     align = text_align_value(block.align)
     size = font_size
+    fontfile = CJK_BOLD_FONT if block.bold else CJK_REGULAR_FONT
+    fontname = FAST_CJK_BOLD_FONT_NAME if block.bold else FAST_CJK_FONT_NAME
     while size >= MIN_FONT_SIZE:
         shape = page.new_shape()
         spare_height = shape.insert_textbox(
             rect,
             translated,
-            fontfile=CJK_REGULAR_FONT,
-            fontname=FAST_CJK_FONT_NAME,
+            fontfile=fontfile,
+            fontname=fontname,
             fontsize=size,
             lineheight=line_height,
             align=align,
@@ -1344,6 +1525,8 @@ def write_translation(
     line_height: float,
 ) -> str:
     rect = fitz.Rect(block.rect)
+    if is_heading(block):
+        rect += (-2, -2, 2, max(3, block.font_size * 0.35))
     font_size = estimate_font_size(rect, translated, block, regular_body_size, line_height)
     if can_use_fast_textbox(block, translated) and write_fast_translation(page, block, translated, font_size, line_height):
         return "fast"
@@ -1371,12 +1554,13 @@ def union_rect(blocks: list[TextBlock]) -> fitz.Rect:
 def group_block(group: LayoutGroup) -> TextBlock:
     first = group.blocks[0]
     rect = union_rect(group.blocks)
+    heading = is_heading(first)
     return TextBlock(
         rect=tuple(rect),
         text=first.text,
         font_size=first.font_size,
         line_count=sum(block.line_count for block in group.blocks),
-        bold=first.bold,
+        bold=first.bold or heading,
         italic=first.italic,
         leading_bold=first.leading_bold,
         align=first.align,
@@ -1390,6 +1574,8 @@ def write_layout_group(
     regular_body_size: float | None,
     line_height: float,
 ) -> str:
+    if group.hidden:
+        return "hidden"
     return write_translation(page, group_block(group), group.text, archive, regular_body_size, line_height)
 
 
@@ -1426,7 +1612,7 @@ def build_pdf(
         for block_index, block in enumerate(page_data.blocks):
             translated = translations[translation_index]
             translation_index += 1
-            if translated == block.text:
+            if translated == block.text and not is_version_footer(page_data, block):
                 continue
             page_translations.append((block_index, block, translated))
 
@@ -1435,7 +1621,7 @@ def build_pdf(
             layout_mode = write_layout_group(target_page, group, archive, regular_body_size, line_height)
             if layout_mode == "fast":
                 fast_layout_calls += 1
-            else:
+            elif layout_mode == "html":
                 html_layout_calls += 1
             processed_blocks += len(group.blocks)
             if logger and processed_blocks % 10 == 0:
