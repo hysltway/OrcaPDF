@@ -355,16 +355,19 @@ def extract_pages(doc: fitz.Document) -> list[PageData]:
                         )
                     )
 
-        blocks.sort(key=lambda block: reading_order_key(page.rect.width, block))
+        ieee_page = any(is_ieee_journal_header(PageData(page_index, page.rect.width, page.rect.height, blocks), block) for block in blocks)
+        blocks.sort(key=lambda block: reading_order_key(page.rect.width, block, ieee_page, page_index))
         blocks = trim_caption_blocks(blocks)
         pages.append(PageData(page_index, page.rect.width, page.rect.height, blocks))
     return pages
 
 
-def reading_order_key(page_width: float, block: TextBlock) -> tuple:
+def reading_order_key(page_width: float, block: TextBlock, ieee_page: bool = False, page_index: int = 0) -> tuple:
     rect = fitz.Rect(block.rect)
     if rect.y1 < 220 and rect.width > 250:
         return 0, rect.y0, rect.x0
+    if ieee_page and page_index > 0 and rect.x0 > page_width / 2 and rect.y0 < 330 and rect.width > 180:
+        return 1, rect.y0, rect.x0
     if rect.width > page_width * 0.65:
         return 1, rect.y0, rect.x0
     column = 0 if rect.x0 < page_width / 2 else 1
@@ -408,9 +411,21 @@ def is_reference_block(page: PageData, block: TextBlock, reference_range: tuple[
         return False
     if page.index < start_page:
         return False
-    if page.index == start_page and block.rect[1] < start_y - 4:
+    if page.index == start_page:
         rect = fitz.Rect(block.rect)
-        return start_y < 160 and rect.x0 > page.width / 2
+        if rect.y0 < start_y - 4 and start_y >= 160:
+            return False
+        start_blocks = [
+            fitz.Rect(candidate.rect)
+            for candidate in page.blocks
+            if re.match(r"^references\b", candidate.text, re.IGNORECASE)
+        ]
+        if start_blocks:
+            start_rect = start_blocks[0]
+            if start_y < 160 and start_rect.x0 > page.width / 2:
+                return rect.x0 > page.width / 2 and rect.y0 >= start_y - 4
+        if rect.y0 < start_y - 4:
+            return False
     if page.index == end_page and block.rect[1] >= end_y - 4:
         return False
     return True
@@ -473,13 +488,40 @@ def is_side_note(page: PageData, block: TextBlock) -> bool:
 def is_first_page_metadata(page: PageData, block: TextBlock) -> bool:
     if page.index != 0:
         return False
-    if block.text.startswith(("*", "∗")):
-        return True
-    if block.rect[1] > page.height - 100:
-        return True
-    if block.rect[1] < 130:
+    text = block.text.strip()
+    rect = fitz.Rect(block.rect)
+    if re.match(r"^abstract\s*[—-]\s*\S", text, re.IGNORECASE):
         return False
-    return block.rect[1] < 220
+    if has_ieee_journal_header(page):
+        if rect.x0 > page.width / 2 and rect.y0 >= 180:
+            return False
+        if text.startswith(("Received ", "Digital Object Identifier", "©")):
+            return True
+        if re.search(r"\b(?:Member|Fellow|Graduate Student Member),\s+IEEE\b", text):
+            return True
+        if " with the " in text or " is with the " in text or "source code can be found" in text.lower():
+            return True
+    if text.startswith(("*", "∗")):
+        return True
+    if rect.y0 > page.height - 100:
+        return True
+    if rect.y0 < 130:
+        return False
+    return rect.y0 < 220
+
+
+def is_ieee_journal_header(page: PageData, block: TextBlock) -> bool:
+    rect = fitz.Rect(block.rect)
+    if rect.y0 > 55 or block.font_size > 8.5:
+        return False
+    text = re.sub(r"\s+", " ", block.text.strip())
+    if "IEEE JOURNAL OF" in text.upper():
+        return True
+    return bool(re.search(r"\bet al\.\s*:", text, re.IGNORECASE)) and re.search(r"\s\d+$", text) is not None
+
+
+def has_ieee_journal_header(page: PageData) -> bool:
+    return any(is_ieee_journal_header(page, block) for block in page.blocks)
 
 
 def is_version_footer(page: PageData, block: TextBlock) -> bool:
@@ -533,8 +575,47 @@ def is_heading(block: TextBlock) -> bool:
     return all(word[:1].isupper() for word in words)
 
 
+def is_lettered_section_heading(block: TextBlock) -> bool:
+    text = block.text.strip()
+    lettered = re.match(r"^[A-Z]\.\s+(.+)", text)
+    if not lettered:
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z-]*", text)
+    return block.font_size >= 9 and 1 <= len(words) <= 12 and len(text) <= 120 and lettered.group(1)[:1].isupper()
+
+
+def is_roman_section_heading(block: TextBlock) -> bool:
+    text = re.sub(r"\s+", " ", block.text.strip())
+    match = re.match(r"^[IVX]+\.\s+(.+)$", text)
+    if not match:
+        return False
+    heading = match.group(1)
+    words = re.findall(r"[A-Za-z][A-Za-z-]*", heading)
+    return block.font_size >= 9 and 1 <= len(words) <= 8 and len(text) <= 90 and heading.upper() == heading
+
+
+def is_title_block(block: TextBlock) -> bool:
+    rect = fitz.Rect(block.rect)
+    return (
+        block.align == "center"
+        and block.font_size >= 14
+        and block.line_count <= 4
+        and rect.width >= 250
+        and word_count(block.text) >= 4
+    )
+
+
+def split_ieee_drop_cap_heading(text: str) -> tuple[str, str] | None:
+    match = re.match(r"^([IVX]+\.\s+[A-Z][A-Za-z ]+)\s+([A-Z])$", text.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
 def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int, float, int, float] | None) -> bool:
     rect = fitz.Rect(block.rect)
+    if is_ieee_journal_header(page, block):
+        return False
     if is_version_footer(page, block):
         return False
     if is_reference_block(page, block, references_start):
@@ -553,6 +634,12 @@ def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int,
         return False
     if page.index == 0 and rect.y0 < 130 and rect.width > 250:
         return should_translate(block.text)
+    if has_ieee_journal_header(page) and split_ieee_drop_cap_heading(block.text):
+        return rect.width >= 25
+    if has_ieee_journal_header(page) and is_roman_section_heading(block):
+        return rect.width >= 25
+    if has_ieee_journal_header(page) and is_lettered_section_heading(block):
+        return rect.width >= 25
     if is_heading(block):
         return rect.width >= 25
     if rect.width < 170:
@@ -640,7 +727,20 @@ def paragraph_continues(text: str) -> bool:
 
 
 def can_merge(prev_page: PageData, prev: TextBlock, page: PageData, block: TextBlock) -> bool:
-    if is_caption(prev.text) or is_caption(block.text) or is_heading(prev) or is_heading(block) or prev.bold or block.bold:
+    if (
+        is_caption(prev.text)
+        or is_caption(block.text)
+        or is_heading(prev)
+        or is_heading(block)
+        or (has_ieee_journal_header(prev_page) and is_roman_section_heading(prev))
+        or (has_ieee_journal_header(page) and is_roman_section_heading(block))
+        or (has_ieee_journal_header(prev_page) and is_lettered_section_heading(prev))
+        or (has_ieee_journal_header(page) and is_lettered_section_heading(block))
+        or prev.bold
+        or block.bold
+    ):
+        return False
+    if has_ieee_journal_header(page) and block.text.lstrip().startswith("•"):
         return False
     if not paragraph_continues(prev.text):
         return False
@@ -675,6 +775,22 @@ def translation_units(blocks: list[tuple[PageData, TextBlock]], references_start
                 current_indexes = []
                 current_texts = []
                 previous = None
+            continue
+
+        if (
+            current_indexes
+            and previous
+            and previous[1].index == page.index
+            and has_ieee_journal_header(page)
+            and (heading_parts := split_ieee_drop_cap_heading(previous[2].text))
+            and abs(fitz.Rect(previous[2].rect).x0 - fitz.Rect(block.rect).x0) <= 24
+            and 0 <= fitz.Rect(block.rect).y0 - fitz.Rect(previous[2].rect).y0 <= 40
+            and re.match(r"^[A-Z][A-Z-]+", block.text)
+        ):
+            current_texts[-1] = heading_parts[0]
+            current_indexes.append(index)
+            current_texts.append(heading_parts[1] + block.text)
+            previous = index, page, block
             continue
 
         merged_text_len = sum(len(text) for text in current_texts) + len(block.text) + len(current_texts)
@@ -882,6 +998,13 @@ COMMON_HEADING_TRANSLATIONS = {
 }
 
 
+IEEE_SECTION_HEADING_TRANSLATIONS = {
+    **COMMON_HEADING_TRANSLATIONS,
+    "experiment": "实验",
+    "results and analyses": "结果与分析",
+}
+
+
 def fixed_heading_translation(text: str) -> str | None:
     stripped = re.sub(r"\s+", " ", text.strip())
     numbered = re.match(r"^(\d+(?:\.\d+)*)\s+(.+)$", stripped)
@@ -946,6 +1069,66 @@ def split_leading_heading(blocks: list[TextBlock], translated: str) -> str:
     return translated
 
 
+def fixed_ieee_section_heading_translation(text: str) -> str | None:
+    match = re.match(r"^([IVX]+)\.\s+(.+)$", re.sub(r"\s+", " ", text.strip()))
+    if not match:
+        return None
+    prefix, heading = match.groups()
+    translated = IEEE_SECTION_HEADING_TRANSLATIONS.get(heading.lower())
+    if not translated:
+        return None
+    return f"{prefix}. {translated}"
+
+
+def strip_leading_ieee_section_heading(translated: str, heading: str, source_heading: str) -> str:
+    text = translated.strip()
+    for candidate in (heading, source_heading):
+        if text.startswith(candidate):
+            return text[len(candidate):].lstrip(" \t\r\n:：,，.。-—")
+
+    heading_word = heading.split(maxsplit=1)[-1] if " " in heading else heading
+    match = re.match(rf"^(?:[IVX]+\.\s*)?{re.escape(heading_word)}\s*[:：,，.。-—]?\s*(.+)$", text, re.S)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def split_ieee_drop_cap_translation(
+    unit_items: list[tuple[PageData, TextBlock]],
+    translated: str,
+    line_height: float,
+) -> list[str] | None:
+    if len(unit_items) < 2:
+        return None
+
+    page, first = unit_items[0]
+    if not has_ieee_journal_header(page):
+        return None
+
+    heading_parts = split_ieee_drop_cap_heading(first.text)
+    if not heading_parts:
+        return None
+
+    second_page, second = unit_items[1]
+    first_rect = fitz.Rect(first.rect)
+    second_rect = fitz.Rect(second.rect)
+    if (
+        second_page.index != page.index
+        or abs(first_rect.x0 - second_rect.x0) > 24
+        or second_rect.y0 - first_rect.y0 > 40
+        or not re.match(r"^[A-Z][A-Z-]+", second.text)
+    ):
+        return None
+
+    heading = fixed_ieee_section_heading_translation(heading_parts[0]) or heading_parts[0]
+    body = strip_leading_ieee_section_heading(translated, heading, heading_parts[0])
+    if not body:
+        return None
+
+    body_blocks = [block for _, block in unit_items[1:]]
+    return [heading, *split_translation(body, body_blocks, line_height)]
+
+
 def source_terms(text: str) -> set[str]:
     terms = set()
     for term in re.findall(r"\b[A-Z][A-Z0-9-]{1,}\b", text):
@@ -978,6 +1161,16 @@ def translation_is_suspicious(source: str, translated: str) -> bool:
     ):
         return True
     return False
+
+
+def title_translation_is_suspicious(source: str, translated: str) -> bool:
+    stripped = translated.strip()
+    if not stripped:
+        return True
+    sentence_count = stripped.count("。") + stripped.count("！") + stripped.count("？")
+    if sentence_count > 1:
+        return True
+    return len(stripped) > max(70, len(source) * 1.8)
 
 
 def parse_translation_response(text: str) -> dict[int, str]:
@@ -1125,6 +1318,55 @@ def translate_unit_text_siliconflow(unit_index: int, text: str, api_key: str) ->
     raise RuntimeError(f"translation unit {unit_index} failed")
 
 
+def translate_title_text_siliconflow(unit_index: int, text: str, api_key: str) -> str:
+    payload = {
+        "model": SILICONFLOW_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Translate this academic paper title into Simplified Chinese. "
+                    "Return one concise title only. Do not explain, summarize, expand, or add a subtitle. "
+                    "Preserve model names, proper nouns, acronyms, and terms in parentheses."
+                ),
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ],
+        "max_tokens": 256,
+        "temperature": 0.1,
+        "top_p": 0.7,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    session = thread_session()
+    with _llm_request_semaphore:
+        for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+            try:
+                response = session.post(
+                    SILICONFLOW_CHAT_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=TRANSLATION_TIMEOUT,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+                message = response.json()["choices"][0]["message"]
+                return clean_translation(message["content"].strip())
+            except Exception as exc:
+                if attempt == TRANSLATION_ATTEMPTS:
+                    raise RuntimeError(f"title translation unit {unit_index} failed: {exc}") from exc
+                time.sleep(RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"title translation unit {unit_index} failed")
+
+
 def translate_batch_google(batch_index: int, batch: list[tuple[int, str]], api_key: str) -> tuple[int, list[tuple[int, str]]]:
     url = f"https://translation.googleapis.com/language/translate/v2?key={api_key}"
     payload = {
@@ -1211,12 +1453,30 @@ def translate_unit_text(unit_index: int, text: str, api_key: str) -> str:
         return translate_unit_text_siliconflow(unit_index, text, api_key)
 
 
+def translate_title_text(unit_index: int, text: str, api_key: str) -> str:
+    provider = os.getenv("TRANSLATE_PROVIDER", "siliconflow").lower()
+    if provider == "google":
+        return translate_unit_text_google(unit_index, text, api_key)
+    else:
+        return translate_title_text_siliconflow(unit_index, text, api_key)
+
+
 def retry_suspicious_translation(unit_index: int, source: str, translated: str, api_key: str) -> str:
     if not translation_is_suspicious(source, translated):
         return translated
 
     retry = translate_unit_text(unit_index, source, api_key)
     if translation_is_suspicious(source, retry):
+        return translated
+    return retry
+
+
+def retry_suspicious_title_translation(unit_index: int, source: str, translated: str, api_key: str) -> str:
+    if not title_translation_is_suspicious(source, translated):
+        return translated
+
+    retry = translate_title_text(unit_index, source, api_key)
+    if title_translation_is_suspicious(source, retry):
         return translated
     return retry
 
@@ -1277,11 +1537,28 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
 
             for unit_index, translated in batch_results:
                 unit = units[unit_index]
-                unit_blocks = [blocks[text_index][1] for text_index in unit.indexes]
+                unit_items = [blocks[text_index] for text_index in unit.indexes]
+                unit_blocks = [block for _, block in unit_items]
                 translated = retry_suspicious_translation(unit_index, unit.text, translated, api_key)
+                if (
+                    len(unit_items) == 1
+                    and unit_items[0][0].index == 0
+                    and has_ieee_journal_header(unit_items[0][0])
+                    and is_title_block(unit_items[0][1])
+                ):
+                    translated = retry_suspicious_title_translation(unit_index, unit.text, translated, api_key)
+                if (
+                    len(unit_items) == 1
+                    and has_ieee_journal_header(unit_items[0][0])
+                    and is_roman_section_heading(unit_items[0][1])
+                    and (fixed_heading := fixed_ieee_section_heading_translation(unit_items[0][1].text))
+                ):
+                    translated = fixed_heading
                 translated = sanitize_translation(unit_blocks, translated)
                 translated = split_leading_heading(unit_blocks, translated)
-                parts = split_translation(translated, unit_blocks, line_height)
+                parts = split_ieee_drop_cap_translation(unit_items, translated, line_height)
+                if parts is None:
+                    parts = split_translation(translated, unit_blocks, line_height)
                 for text_index, part in zip(unit.indexes, parts, strict=True):
                     results[text_index] = part
 
