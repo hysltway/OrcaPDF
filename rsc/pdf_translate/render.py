@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import re
 import time
 from functools import cache
 from pathlib import Path
@@ -18,7 +17,7 @@ from .config import (
     FONT_FACE_CSS,
     MIN_FONT_SIZE,
 )
-from .extraction import body_font_size, find_references_range, is_heading, is_version_footer
+from .extraction import body_font_size, find_references_range, is_caption, is_heading, is_version_footer
 from .models import LayoutGroup, Logger, PageData, TextBlock
 from .units import layout_groups
 
@@ -148,31 +147,58 @@ body {{ margin: 0; font-size: {font_size}pt; line-height: {line_height}; text-al
 """
 
 
-def estimate_font_size(rect: fitz.Rect, text: str, block: TextBlock, regular_body_size: float | None, line_height: float) -> float:
-    limit = 18.0 if (block.align == "center" or block.bold or block.line_count <= 2) else 10.0
-    source_size = (
-        regular_body_size
-        if regular_body_size
-        and block.align == "left"
+def round_font_size(size: float) -> float:
+    return round(max(MIN_FONT_SIZE, size) * 2) / 2
+
+
+def is_body_like_translation_block(rect: fitz.Rect, block: TextBlock) -> bool:
+    return (
+        block.align == "left"
         and not block.bold
         and not block.italic
-        and not block.leading_bold
+        and not is_caption(block.text)
         and block.line_count >= 2
         and rect.width >= 170
-        and 6 <= block.font_size <= 12
-        else block.font_size
+        and block.font_size <= 12
     )
-    size = min(source_size, limit)
-    chars_per_line = max(1, int(rect.width / (size * 0.9)))
-    line_count = (len(text) + chars_per_line - 1) // chars_per_line
-    if line_count * size * line_height > rect.height * 1.35:
-        while size > MIN_FONT_SIZE:
-            chars_per_line = max(1, int(rect.width / (size * 0.9)))
-            line_count = (len(text) + chars_per_line - 1) // chars_per_line
-            if line_count * size * line_height <= rect.height * 1.2:
-                return size
-            size -= 0.5
-    return size
+
+
+def base_font_size(rect: fitz.Rect, block: TextBlock, regular_body_size: float | None) -> float:
+    if is_body_like_translation_block(rect, block):
+        body_size = regular_body_size or block.font_size
+        if body_size >= 9.5:
+            body_size -= 1.0
+        elif body_size >= 8.5:
+            body_size -= 0.5
+        return round_font_size(min(body_size, 9.5))
+    limit = 18.0 if (block.align == "center" or block.bold or block.line_count <= 2) else 10.0
+    return round_font_size(min(block.font_size, limit))
+
+
+def font_size_candidates(rect: fitz.Rect, block: TextBlock, regular_body_size: float | None) -> list[float]:
+    base = base_font_size(rect, block, regular_body_size)
+    drops = (0.0, 0.5, 1.0, 1.5, 2.0) if is_body_like_translation_block(rect, block) else (0.0, 0.5, 1.0, 1.5, 2.0)
+    sizes = []
+    for drop in drops:
+        size = round_font_size(base - drop)
+        if size not in sizes:
+            sizes.append(size)
+    return sizes
+
+
+def layout_candidates(
+    rect: fitz.Rect,
+    block: TextBlock,
+    regular_body_size: float | None,
+    line_height: float,
+) -> list[tuple[float, float]]:
+    sizes = font_size_candidates(rect, block, regular_body_size)
+    line_heights = [line_height]
+    if is_body_like_translation_block(rect, block):
+        for compact_line_height in (1.1, 1.0):
+            if compact_line_height < line_height and compact_line_height not in line_heights:
+                line_heights.append(compact_line_height)
+    return [(size, candidate_line_height) for size in sizes for candidate_line_height in line_heights]
 
 
 def cover_original_text(page: fitz.Page, blocks: list[TextBlock]) -> int:
@@ -204,15 +230,13 @@ def write_fast_translation(
     page: fitz.Page,
     block: TextBlock,
     translated: str,
-    font_size: float,
-    line_height: float,
+    candidates: list[tuple[float, float]],
 ) -> bool:
     rect = fitz.Rect(block.rect)
     align = text_align_value(block.align)
-    size = font_size
     fontfile = CJK_BOLD_FONT if block.bold else CJK_REGULAR_FONT
     fontname = FAST_CJK_BOLD_FONT_NAME if block.bold else FAST_CJK_FONT_NAME
-    while size >= MIN_FONT_SIZE:
+    for size, line_height in candidates:
         shape = page.new_shape()
         spare_height = shape.insert_textbox(
             rect,
@@ -226,8 +250,49 @@ def write_fast_translation(
         if spare_height >= 0:
             shape.commit(overlay=True)
             return True
-        size -= 0.5
     return False
+
+
+def write_html_translation(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    html_text: str,
+    block: TextBlock,
+    archive: fitz.Archive,
+    candidates: list[tuple[float, float]],
+) -> None:
+    for size, line_height in candidates:
+        spare_height, _ = page.insert_htmlbox(
+            rect,
+            html_text,
+            css=textbox_css(size, block.align, line_height),
+            archive=archive,
+            scale_low=1,
+            overlay=True,
+        )
+        if spare_height >= 0:
+            return
+
+    size, line_height = candidates[-1]
+    spare_height, _ = page.insert_htmlbox(
+        rect,
+        html_text,
+        css=textbox_css(size, block.align, line_height),
+        archive=archive,
+        scale_low=0.9,
+        overlay=True,
+    )
+    if spare_height >= 0:
+        return
+
+    page.insert_htmlbox(
+        rect,
+        html_text,
+        css=textbox_css(size, block.align, line_height),
+        archive=archive,
+        scale_low=0.4,
+        overlay=True,
+    )
 
 
 def write_translation(
@@ -237,24 +302,29 @@ def write_translation(
     archive: fitz.Archive,
     regular_body_size: float | None,
     line_height: float,
+    used_rects: list[fitz.Rect] | None = None,
 ) -> str:
     rect = fitz.Rect(block.rect)
+    if used_rects is not None:
+        for used in used_rects:
+            overlaps_x = min(rect.x1, used.x1) - max(rect.x0, used.x0) > 20
+            overlaps_y = min(rect.y1, used.y1) - max(rect.y0, used.y0) > 1
+            if overlaps_x and overlaps_y:
+                rect.y0 = max(rect.y0, used.y1 + 1)
+        if rect.y0 >= rect.y1 - 2:
+            rect = fitz.Rect(block.rect)
     if is_heading(block):
         rect += (-2, -2, 2, max(3, block.font_size * 0.35))
-    font_size = estimate_font_size(rect, translated, block, regular_body_size, line_height)
-    if can_use_fast_textbox(block, translated) and write_fast_translation(page, block, translated, font_size, line_height):
+    candidates = layout_candidates(rect, block, regular_body_size, line_height)
+    if can_use_fast_textbox(block, translated) and write_fast_translation(page, block, translated, candidates):
+        if used_rects is not None:
+            used_rects.append(rect)
         return "fast"
 
     html_text = styled_html(translated, block)
-    css = textbox_css(font_size, block.align, line_height)
-    page.insert_htmlbox(
-        rect,
-        html_text,
-        css=css,
-        archive=archive,
-        scale_low=0.4,
-        overlay=True,
-    )
+    write_html_translation(page, rect, html_text, block, archive, candidates)
+    if used_rects is not None:
+        used_rects.append(rect)
     return "html"
 
 
@@ -287,10 +357,11 @@ def write_layout_group(
     archive: fitz.Archive,
     regular_body_size: float | None,
     line_height: float,
+    used_rects: list[fitz.Rect] | None = None,
 ) -> str:
     if group.hidden:
         return "hidden"
-    return write_translation(page, group_block(group), group.text, archive, regular_body_size, line_height)
+    return write_translation(page, group_block(group), group.text, archive, regular_body_size, line_height, used_rects)
 
 
 def build_pdf(
@@ -323,6 +394,7 @@ def build_pdf(
     for page_data in pages:
         target_page = output[page_data.index]
         page_translations = []
+        used_rects: list[fitz.Rect] = []
         for block_index, block in enumerate(page_data.blocks):
             translated = translations[translation_index]
             translation_index += 1
@@ -332,7 +404,7 @@ def build_pdf(
 
         covered_blocks += cover_original_text(target_page, [block for _, block, _ in page_translations])
         for group in layout_groups(page_data, page_translations, references_start):
-            layout_mode = write_layout_group(target_page, group, archive, regular_body_size, line_height)
+            layout_mode = write_layout_group(target_page, group, archive, regular_body_size, line_height, used_rects)
             if layout_mode == "fast":
                 fast_layout_calls += 1
             elif layout_mode == "html":

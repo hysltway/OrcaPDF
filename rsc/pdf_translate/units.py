@@ -163,6 +163,8 @@ def can_merge_layout_block(page: PageData, prev: TextBlock, block: TextBlock) ->
     rect = fitz.Rect(block.rect)
     gap = rect.y0 - prev_rect.y1
     same_column = (prev_rect.x0 < page.width / 2) == (rect.x0 < page.width / 2)
+    if rect.y0 < prev_rect.y1 - 2:
+        return False
     return (
         -2 <= gap <= max(28, prev.font_size * 3.0)
         and rect.y0 >= prev_rect.y0 - 2

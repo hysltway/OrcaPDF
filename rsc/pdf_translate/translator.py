@@ -24,7 +24,10 @@ from .config import (
 from .extraction import (
     find_references_range,
     has_ieee_journal_header,
+    is_conference_header,
+    is_formula_context_label,
     is_heading,
+    is_lettered_section_heading,
     is_roman_section_heading,
     is_title_block,
     split_ieee_drop_cap_heading,
@@ -41,6 +44,42 @@ def clean_translation(text: str) -> str:
     text = re.sub(r"</?(?:sub|sup)>", "", text)
     text = html.unescape(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(
+        r"\s*[\(（][^\)）]*(?:text (?:seems )?(?:continues|is incomplete|appears incomplete)|translation ends|incomplete text)[^\)）]*[\)）]\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*[\(（][^\)）]*(?:原文未提供|原文未给出|原文不完整|文本不完整|此处应为|未给出完整|缺少上下文)[^\)）]*[\)）]\.?",
+        "",
+        text,
+    )
+    text = re.sub(r"\s*(?:……|\.{3,})(?=[，。！？；：、\s]|$)", "", text)
+    text = re.sub(r"\s*[≤<>=]\s*(?=[，。！？；：、\s]|$)", "", text)
+    text = re.sub(r"\\(?:mathbb|mathcal|mathrm|mathbf|operatorname)\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\(?:text|mbox)\{([^{}]+)\}", r"\1", text)
+    latex_symbols = {
+        "Phi": "Φ",
+        "phi": "φ",
+        "sigma": "σ",
+        "lambda": "λ",
+        "Lambda": "Λ",
+        "alpha": "α",
+        "beta": "β",
+        "delta": "δ",
+        "epsilon": "ϵ",
+        "in": "∈",
+        "times": "×",
+        "cdot": "·",
+        "circ": "◦",
+        "leq": "≤",
+        "geq": "≥",
+    }
+    text = re.sub(r"\\([A-Za-z]+)", lambda match: latex_symbols.get(match.group(1), ""), text)
+    text = text.replace("\\", "")
+    text = re.sub(r"\${1,2}\s*([^$]+?)\s*\${1,2}", r"\1", text)
+    text = text.replace("$$", "").replace("$", "")
     text = re.sub(r"[ \t]*\n+[ \t]*", " ", text)
     text = re.sub(r"[ \t]*\n[ \t]*", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -73,11 +112,53 @@ COMMON_HEADING_TRANSLATIONS = {
     "references": "参考文献",
     "acknowledgments": "致谢",
     "acknowledgements": "致谢",
+    "sample complexity": "样本复杂度",
+    "expressive power": "表达能力",
+    "stability": "稳定性",
+    "computational complexity": "计算复杂度",
+    "baselines": "基线方法",
+    "architectures": "架构",
+    "stability analysis": "稳定性分析",
+    "implementation details": "实现细节",
+    "additional experiments": "补充实验",
+    "ablation studies": "消融研究",
+}
+
+
+HEADING_PHRASE_TRANSLATIONS = {
+    "our work": "我们的工作",
+    "our work: learnable, efficient, and powerful pes with gnns": "我们的工作：基于GNNs的可学习、高效且强大的位置编码（PEs）",
+    "gnns are nonlinear functions of gso eigenvectors": "GNNs是GSO特征向量的非线性函数",
+    "pearl: expressive and equivariant positional encoding networks": "PEARL：表达能力强且等变的位置编码网络",
+    "our work: random positional encoding network (r-pearl)": "我们的工作：随机位置编码网络（R-PEARL）",
+    "comparing pearl to structural pes": "将PEARL与结构化PEs进行比较",
+    "proof of proposition 3.1": "命题3.1的证明",
+    "proof of corollary 4.4": "推论4.4的证明",
+    "basis universality of pearl": "PEARL的基普适性",
+    "our work: basis positional encoding networks (b-pearl)": "我们的工作：基位置编码网络（B-PEARL）",
+    "relation to eigenvector based encodings": "与基于特征向量的编码的关系",
+    "graph classification on social networks": "社交网络上的图分类",
+    "graph regression on molecular graphs": "分子图上的图回归",
+    "large-scale link prediction on relational databases (relbench)": "关系数据库（RelBench）上的大规模链接预测",
+    "pearl is a universal function of eigenvalues": "PEARL是特征值的通用函数",
+    "effect of pointwise activation to the variance of a random variable": "逐点激活对随机变量方差的影响",
+    "effect of graph convolution to the variance of a random node signal": "图卷积对随机节点信号方差的影响",
+    "lipschitz and integral lipschitz filters": "Lipschitz与积分Lipschitz滤波器",
+    "stability bounds for random and basis pes": "随机PEs和基PEs的稳定性界",
+    "spectral filters with graph filters": "带图滤波器的谱滤波器",
+    "experiments on graph isomorphism": "图同构实验",
+    "experiments on peptides-struct dataset": "Peptides-struct数据集实验",
+    "ablation on different backbone models": "不同骨干模型的消融",
+    "ablation on k": "K的消融",
+    "ablation on number of samples m": "样本数M的消融",
+    "ablation on the number of gnn layers in pearl": "PEARL中GNN层数的消融",
+    "ablation on different parameter size": "不同参数规模的消融",
 }
 
 
 IEEE_SECTION_HEADING_TRANSLATIONS = {
     **COMMON_HEADING_TRANSLATIONS,
+    "baselines": "基线方法",
     "experiment": "实验",
     "results and analyses": "结果与分析",
 }
@@ -85,14 +166,34 @@ IEEE_SECTION_HEADING_TRANSLATIONS = {
 
 def fixed_heading_translation(text: str) -> str | None:
     stripped = re.sub(r"\s+", " ", text.strip())
-    numbered = re.match(r"^(\d+(?:\.\d+)*)\s+(.+)$", stripped)
-    if numbered:
-        prefix, heading = numbered.groups()
-        translated = COMMON_HEADING_TRANSLATIONS.get(heading.lower())
+    prefixed = re.match(r"^([A-Z](?:\.\d+)*|\d+(?:\.\d+)*)\s+(.+)$", stripped)
+    if prefixed:
+        prefix, heading = prefixed.groups()
+        translated = heading_phrase_translation(heading)
         if translated:
             return f"{prefix} {translated}"
         return None
-    return COMMON_HEADING_TRANSLATIONS.get(stripped.lower())
+    return heading_phrase_translation(stripped)
+
+
+def heading_phrase_translation(text: str) -> str | None:
+    key = text.strip().lower()
+    if key in COMMON_HEADING_TRANSLATIONS:
+        return COMMON_HEADING_TRANSLATIONS[key]
+    if key in HEADING_PHRASE_TRANSLATIONS:
+        return HEADING_PHRASE_TRANSLATIONS[key]
+
+    proof = re.match(r"proof of (proposition|theorem|lemma|corollary)\s+([\w.]+)", key)
+    if proof:
+        label, number = proof.groups()
+        label_zh = {
+            "proposition": "命题",
+            "theorem": "定理",
+            "lemma": "引理",
+            "corollary": "推论",
+        }[label]
+        return f"{label_zh}{number}的证明"
+    return None
 
 
 def sanitize_translation(blocks: list[TextBlock], translated: str) -> str:
@@ -108,6 +209,8 @@ def sanitize_translation(blocks: list[TextBlock], translated: str) -> str:
         return fixed
 
     stripped = translated.strip()
+    if translation_is_suspicious(block.text, stripped) or title_translation_is_suspicious(block.text, stripped):
+        return block.text
     if len(stripped) > max(28, len(block.text) * 3) or "\n" in stripped:
         return block.text
     if stripped.count("。") + stripped.count(".") > 1:
@@ -126,6 +229,37 @@ INLINE_HEADING_TRANSLATIONS = {
     "conclusion": "结论",
     "conclusions": "结论",
 }
+
+
+FORMULA_CONTEXT_TRANSLATIONS = {
+    "where": "其中",
+    "satisfies": "满足：",
+    "such that": "使得：",
+    "as follows": "如下：",
+}
+
+
+def fixed_short_translation(text: str) -> str | None:
+    stripped = re.sub(r"\s+", " ", text.strip())
+    if re.search(
+        r"\b(?:published as|accepted as|under review).{0,40}\b(?:conference paper|workshop paper|ICLR|ICML|NeurIPS|OpenReview)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return "发表于ICLR 2025会议论文"
+    if re.search(r"\bcorrespond(?:a|e)nce to:\s*\S+", stripped, re.IGNORECASE):
+        translated = re.sub(
+            r"(\*|∗)?\s*correspond(?:a|e)nce to:\s*([^\s.]+(?:\.[^\s.]+)*\.[A-Za-z]{2,})\.?",
+            r"∗通信至：\2。",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        translated = re.sub(r"(†)?\s*equal senior authorship\.?", "†共同高级作者。", translated, flags=re.IGNORECASE)
+        return translated
+    if is_formula_context_label(stripped):
+        key = stripped.rstrip(":：").lower()
+        return FORMULA_CONTEXT_TRANSLATIONS.get(key)
+    return None
 
 
 def split_leading_heading(blocks: list[TextBlock], translated: str) -> str:
@@ -148,7 +282,7 @@ def split_leading_heading(blocks: list[TextBlock], translated: str) -> str:
 
 
 def fixed_ieee_section_heading_translation(text: str) -> str | None:
-    match = re.match(r"^([IVX]+)\.\s+(.+)$", re.sub(r"\s+", " ", text.strip()))
+    match = re.match(r"^([A-Z]+)\.\s+(.+)$", re.sub(r"\s+", " ", text.strip()))
     if not match:
         return None
     prefix, heading = match.groups()
@@ -229,10 +363,29 @@ def translation_preserves_terms(source: str, translated: str) -> bool:
     return present >= max(1, len(required) // 3)
 
 
+def translation_looks_untranslated(source: str, translated: str) -> bool:
+    source_words = re.findall(r"\b[A-Za-z][A-Za-z-]{2,}\b", source)
+    if len(source_words) < 6:
+        return False
+    translated_words = re.findall(r"\b[A-Za-z][A-Za-z-]{2,}\b", translated)
+    chinese_chars = re.findall(r"[\u3400-\u9fff]", translated)
+    if len(chinese_chars) >= max(6, len(source_words) // 4):
+        return False
+    return len(translated_words) >= max(4, len(source_words) // 2)
+
+
 def translation_is_suspicious(source: str, translated: str) -> bool:
     if not translation_preserves_terms(source, translated):
         return True
+    if translation_looks_untranslated(source, translated):
+        return True
     source_lower = source.lower()
+    if ("gnn" in source_lower or "gso" in source_lower or "positional encoding" in source_lower or "pearl" in source_lower) and re.search(
+        r"全球导航|卫星|强化学习|生成对抗|GAN",
+        translated,
+        re.IGNORECASE,
+    ):
+        return True
     if ("eeg" in source_lower or "brain" in source_lower or "neural" in source_lower) and re.search(
         r"材料|冲击|载荷|应力|变形|破坏模式|工程设计",
         translated,
@@ -289,6 +442,11 @@ def translate_batch_siliconflow(batch_index: int, batch: list[tuple[int, str]], 
                     "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
                     "Preserve terminology consistency, proper nouns, model names, dataset names, citations, numbers, "
                     "units, formulas, inline variables, punctuation that belongs to equations, and bracketed references. "
+                    "Translate theorem, proposition, lemma, corollary, proof, assumption, definition, remark, section, "
+                    "appendix, acknowledgment, and conclusion labels into Simplified Chinese. "
+                    "Do not wrap formulas, variables, or translated text in $ or $$ delimiters. "
+                    "If the source is a sentence fragment split by a formula, translate only the visible fragment; "
+                    "do not add comments such as incomplete text or text continues. "
                     "Do not insert manual line breaks. Keep each original paragraph as one paragraph; only use a blank line "
                     "between paragraphs when the source text clearly contains separate paragraphs. "
                     "Do not convert inline enumerations into lists and do not add blank lines. "
@@ -352,6 +510,11 @@ def translate_unit_text_siliconflow(unit_index: int, text: str, api_key: str) ->
                     "You are translating academic PDF text from English into Simplified Chinese. "
                     "Use precise, fluent academic Chinese. Keep the original meaning complete and do not summarize. "
                     "Preserve terminology, proper nouns, citations, numbers, units, formulas, and inline variables. "
+                    "Translate theorem, proposition, lemma, corollary, proof, assumption, definition, remark, section, "
+                    "appendix, acknowledgment, and conclusion labels into Simplified Chinese. "
+                    "Do not wrap formulas, variables, or translated text in $ or $$ delimiters. "
+                    "If the source is a sentence fragment split by a formula, translate only the visible fragment; "
+                    "do not add comments such as incomplete text or text continues. "
                     "Do not insert manual line breaks. Keep the original text as one paragraph unless the source clearly "
                     "contains separate paragraphs; in that case separate paragraphs with exactly one blank line. "
                     "Do not convert inline enumerations into lists and do not add blank lines. "
@@ -545,6 +708,8 @@ def retry_suspicious_translation(unit_index: int, source: str, translated: str, 
 
     retry = translate_unit_text(unit_index, source, api_key)
     if translation_is_suspicious(source, retry):
+        if re.search(r"[\u3400-\u9fff]", retry) and not re.search(r"[\u3400-\u9fff]", translated):
+            return retry
         return translated
     return retry
 
@@ -576,6 +741,9 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
         progress_callback.on_blocks_analyzed(len(texts), len(active), len(batches))
 
     if not batches:
+        for text_index, (page, block) in enumerate(blocks):
+            if (is_conference_header(page, block) or results[text_index] == block.text) and (fixed := fixed_short_translation(block.text)):
+                results[text_index] = fixed
         return results
 
     workers = min(MAX_CONCURRENT_BATCHES, len(batches))
@@ -617,7 +785,12 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
                 unit = units[unit_index]
                 unit_items = [blocks[text_index] for text_index in unit.indexes]
                 unit_blocks = [block for _, block in unit_items]
-                translated = retry_suspicious_translation(unit_index, unit.text, translated, api_key)
+                if len(unit_items) == 1 and (fixed := fixed_short_translation(unit.text)):
+                    translated = fixed
+                elif len(unit_items) == 1 and (fixed := fixed_heading_translation(unit.text)):
+                    translated = fixed
+                else:
+                    translated = retry_suspicious_translation(unit_index, unit.text, translated, api_key)
                 if (
                     len(unit_items) == 1
                     and unit_items[0][0].index == 0
@@ -628,10 +801,19 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
                 if (
                     len(unit_items) == 1
                     and has_ieee_journal_header(unit_items[0][0])
-                    and is_roman_section_heading(unit_items[0][1])
+                    and (
+                        is_roman_section_heading(unit_items[0][1])
+                        or is_lettered_section_heading(unit_items[0][1])
+                    )
                     and (fixed_heading := fixed_ieee_section_heading_translation(unit_items[0][1].text))
                 ):
                     translated = fixed_heading
+                if (
+                    len(unit_items) == 1
+                    and is_conference_header(unit_items[0][0], unit_items[0][1])
+                    and (fixed := fixed_short_translation(unit.text))
+                ):
+                    translated = fixed
                 translated = sanitize_translation(unit_blocks, translated)
                 translated = split_leading_heading(unit_blocks, translated)
                 parts = split_ieee_drop_cap_translation(unit_items, translated, line_height)
@@ -647,5 +829,8 @@ def translate_blocks(pages: list[PageData], api_key: str, logger: Logger, progre
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    return results
+    for text_index, (page, block) in enumerate(blocks):
+        if (is_conference_header(page, block) or results[text_index] == block.text) and (fixed := fixed_short_translation(block.text)):
+            results[text_index] = fixed
 
+    return results

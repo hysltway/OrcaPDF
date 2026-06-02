@@ -117,6 +117,38 @@ def split_wrapped_lines(page_width: float, lines: list[dict]) -> list[list[dict]
     return [lines]
 
 
+def formula_like_line(line: dict) -> bool:
+    text = line_text(line)
+    if not text:
+        return True
+    if word_count(text) > 1:
+        return False
+    if re.fullmatch(r"[A-Z]", text):
+        return True
+    math_chars = sum(1 for char in text if char in "=<>≤≥∈∥⊤⊂∑µκτδϵαθπ−+*/{}[]()")
+    return math_chars > 0 or re.fullmatch(r"[\d\s.,]+", text) is not None
+
+
+def split_mixed_formula_tail(lines: list[dict]) -> list[list[dict]]:
+    if len(lines) < 3:
+        return [lines]
+
+    for index in range(1, len(lines)):
+        head = lines[:index]
+        tail = lines[index:]
+        if word_count(block_text(head)) < 4:
+            continue
+        if not any(line_text(line) for line in tail):
+            continue
+        if not all(formula_like_line(line) for line in tail):
+            continue
+        tail_rect = fitz.Rect(lines_bbox(tail))
+        head_rect = fitz.Rect(lines_bbox(head))
+        if tail_rect.width <= 80 and tail_rect.x0 > head_rect.x0 + 20:
+            return [head, tail]
+    return [lines]
+
+
 def trim_caption_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
     trimmed = []
     for block in blocks:
@@ -236,28 +268,29 @@ def extract_pages(doc: fitz.Document) -> list[PageData]:
             groups = split_caption_lines(raw.get("lines", []))
             for group_index, group in enumerate(groups):
                 for lines in split_wrapped_lines(page.rect.width, group):
-                    text = block_text(lines)
-                    if not text:
-                        continue
-                    bold, italic, leading_bold = block_style(lines)
-                    rect = lines_bbox(lines)
-                    if group_index == 0 and len(groups) > 1 and is_caption(text):
-                        next_y = min(line["bbox"][1] for line in groups[1])
-                        rect = (rect[0], rect[1], rect[2], max(rect[1] + 6, min(rect[3], next_y - 1)))
+                    for split_lines in split_mixed_formula_tail(lines):
+                        text = block_text(split_lines)
+                        if not text:
+                            continue
+                        bold, italic, leading_bold = block_style(split_lines)
+                        rect = lines_bbox(split_lines)
+                        if group_index == 0 and len(groups) > 1 and is_caption(text):
+                            next_y = min(line["bbox"][1] for line in groups[1])
+                            rect = (rect[0], rect[1], rect[2], max(rect[1] + 6, min(rect[3], next_y - 1)))
 
-                    font_size = first_font_size(lines)
-                    blocks.append(
-                        TextBlock(
-                            rect=rect,
-                            text=text,
-                            font_size=font_size,
-                            line_count=line_count(lines),
-                            bold=bold,
-                            italic=italic,
-                            leading_bold=leading_bold,
-                            align=block_align(page.rect.width, lines, font_size),
+                        font_size = first_font_size(split_lines)
+                        blocks.append(
+                            TextBlock(
+                                rect=rect,
+                                text=text,
+                                font_size=font_size,
+                                line_count=line_count(split_lines),
+                                bold=bold,
+                                italic=italic,
+                                leading_bold=leading_bold,
+                                align=block_align(page.rect.width, split_lines, font_size),
+                            )
                         )
-                    )
 
         ieee_page = any(is_ieee_journal_header(PageData(page_index, page.rect.width, page.rect.height, blocks), block) for block in blocks)
         blocks.sort(key=lambda block: reading_order_key(page.rect.width, block, ieee_page, page_index))
@@ -266,16 +299,42 @@ def extract_pages(doc: fitz.Document) -> list[PageData]:
     return pages
 
 
+def reading_order_line_priority(text: str) -> int:
+    stripped = text.strip()
+    if re.match(r"^[a-z]\s*(?:=|≤|<|>|∈|\()", stripped):
+        return 1
+    if re.match(r"^[a-z]\s*=", stripped):
+        return 1
+    return 0
+
+
 def reading_order_key(page_width: float, block: TextBlock, ieee_page: bool = False, page_index: int = 0) -> tuple:
     rect = fitz.Rect(block.rect)
+    y_bucket = round(rect.y0 / 3) * 3
+    line_priority = reading_order_line_priority(block.text)
     if rect.y1 < 220 and rect.width > 250:
-        return 0, rect.y0, rect.x0
+        return 0, 0, y_bucket, line_priority, rect.x0
     if ieee_page and page_index > 0 and rect.x0 > page_width / 2 and rect.y0 < 330 and rect.width > 180:
-        return 1, rect.y0, rect.x0
+        return 1, 0, y_bucket, line_priority, rect.x0
     if rect.width > page_width * 0.65:
-        return 1, rect.y0, rect.x0
+        return 2, 0, y_bucket, line_priority, rect.x0
     column = 0 if rect.x0 < page_width / 2 else 1
-    return 2, column, rect.y0, rect.x0
+    return 2, column, y_bucket, line_priority, rect.x0
+
+
+def is_appendix_heading_text(text: str) -> bool:
+    stripped = re.sub(r"\s+", " ", text.strip())
+    if re.match(r"^(?:Append(?:ix|ices)|Technical Appendices|Supplementary Material)\b", stripped, re.IGNORECASE):
+        return True
+    if len(stripped) > 140:
+        return False
+    match = re.match(r"^[A-Z](?:\.\d+)*\s+(.+)$", stripped)
+    if not match:
+        return False
+    heading = match.group(1)
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9 .,,:;()&/\-]*", heading):
+        return False
+    return len(re.sub(r"[^A-Z0-9]", "", heading)) >= 4
 
 
 def find_references_range(pages: list[PageData]) -> tuple[int, float, int, float] | None:
@@ -300,7 +359,7 @@ def find_references_range(pages: list[PageData]) -> tuple[int, float, int, float
                 r"^(?:[A-Z]\s+)?(?:Append(?:ix|ices)|Technical Appendices|Supplementary Material)\b|^NeurIPS Paper Checklist\b",
                 block.text,
                 re.IGNORECASE,
-            ):
+            ) or is_appendix_heading_text(block.text):
                 return start_page, start_y, page.index, block.rect[1]
 
     return start_page, start_y, len(pages), float("inf")
@@ -342,6 +401,8 @@ def is_table_block(block: TextBlock) -> bool:
     word_count = len(re.findall(r"[A-Za-z][A-Za-z-]*", text))
     complexity_count = len(re.findall(r"O\(", text))
 
+    if re.match(r"^Dataset\s+(?:[IVX]+|\d+):\s+Dataset\s+(?:[IVX]+|\d+)\s+", text, re.IGNORECASE):
+        return False
     if looks_like_table_header(text):
         return True
     if complexity_count >= 2 and word_count <= 60:
@@ -394,6 +455,8 @@ def is_first_page_metadata(page: PageData, block: TextBlock) -> bool:
         return False
     text = block.text.strip()
     rect = fitz.Rect(block.rect)
+    if re.fullmatch(r"abstract", text, re.IGNORECASE):
+        return False
     if re.match(r"^abstract\s*[—-]\s*\S", text, re.IGNORECASE):
         return False
     if has_ieee_journal_header(page):
@@ -442,6 +505,18 @@ def is_version_footer(page: PageData, block: TextBlock) -> bool:
     ) is not None
 
 
+def is_conference_header(page: PageData, block: TextBlock) -> bool:
+    rect = fitz.Rect(block.rect)
+    if rect.y0 > 65:
+        return False
+    text = re.sub(r"\s+", " ", block.text.strip())
+    return re.search(
+        r"\b(?:published as|accepted as|under review).{0,40}\b(?:conference paper|workshop paper|ICLR|ICML|NeurIPS|OpenReview)\b",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
 def is_caption(text: str) -> bool:
     return re.search(r"\b(figure|fig\.|table)\s*\d+[:.]", text.strip(), re.IGNORECASE) is not None
 
@@ -454,16 +529,41 @@ def is_figure_label(page: PageData, block: TextBlock) -> bool:
         return True
     if page.index > 0 and rect.y1 < 180 and block.font_size <= 8.5 and len(words) <= 8:
         return True
-    if bool(re.search(r"\([a-z]\)", text)) and rect.y1 < 540 and word_count(text) <= 20:
+    if (
+        bool(re.search(r"\([a-z]\)", text))
+        and rect.y1 < 540
+        and word_count(text) <= 20
+        and (rect.width < 240 or block.font_size <= 8.5)
+    ):
         return True
     return len(page.blocks) > 40 and rect.y1 < 430 and rect.width < 220 and len(words) <= 12
+
+
+def is_formula_context_label(text: str) -> bool:
+    stripped = re.sub(r"\s+", " ", text.strip()).rstrip(":：").lower()
+    return stripped in {"where", "satisfies", "such that", "as follows"}
 
 
 def is_heading(block: TextBlock) -> bool:
     text = block.text.strip()
     words = re.findall(r"[A-Za-z][A-Za-z-]*", text)
+    if is_appendix_heading(block):
+        return True
+    if (
+        block.font_size >= 9.5
+        and block.line_count <= 2
+        and 2 <= len(words) <= 5
+        and len(text) > 4
+        and not re.search(r"\d+(?:\.\d+)", text)
+        and text.upper() == text
+        and not any(char in text for char in "=∈∥⊤⊂∑µκτδϵαθπ−+*/{}[]()")
+    ):
+        return True
     numbered = re.match(r"^\d+(?:\.\d+)*\s+(.+)", text)
-    if numbered and 1 <= len(words) <= 12 and len(text) <= 120:
+    if numbered and block.line_count <= 2 and 1 <= len(words) <= 12 and len(text) <= 120:
+        heading_text = numbered.group(1).strip()
+        if re.match(r"^\d", heading_text) or re.fullmatch(r"[A-Z]", heading_text):
+            return False
         first_word = words[0] if words else ""
         return bool(first_word[:1].isupper())
     if block.font_size < 9:
@@ -476,7 +576,13 @@ def is_heading(block: TextBlock) -> bool:
         return False
     if len(text) > 80:
         return False
+    if len(text) <= 4:
+        return False
     return all(word[:1].isupper() for word in words)
+
+
+def is_appendix_heading(block: TextBlock) -> bool:
+    return block.font_size >= 9 and block.line_count <= 2 and is_appendix_heading_text(block.text)
 
 
 def is_lettered_section_heading(block: TextBlock) -> bool:
@@ -520,6 +626,8 @@ def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int,
     rect = fitz.Rect(block.rect)
     if is_ieee_journal_header(page, block):
         return False
+    if is_conference_header(page, block):
+        return False
     if is_version_footer(page, block):
         return False
     if is_reference_block(page, block, references_start):
@@ -547,6 +655,8 @@ def is_body_block(page: PageData, block: TextBlock, references_start: tuple[int,
     if is_heading(block):
         return rect.width >= 25
     if rect.width < 170:
+        if is_formula_context_label(block.text):
+            return True
         return False
     return should_translate(block.text)
 
@@ -576,4 +686,3 @@ def body_font_size(pages: list[PageData], references_start: tuple[int, float, in
         return None
     sizes.sort()
     return round(sizes[len(sizes) // 2] * 2) / 2
-
